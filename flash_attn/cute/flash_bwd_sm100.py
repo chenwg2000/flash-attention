@@ -207,31 +207,34 @@ class FlashAttentionBackwardSm100:
             self.tmem_dS_offset = self.tmem_dP_offset  # overlap with dP
 
         if (not is_causal and not is_local) or deterministic:
-            self.num_regs_reduce = 144 if self.use_2cta_instrs else 152
+            self.num_regs_reduce = 136 if self.use_2cta_instrs else 152
             self.num_regs_compute = 136
+            self.num_regs_load = 104 if self.use_2cta_instrs else 96 - 8
+            self.num_regs_mma = 104 if self.use_2cta_instrs else self.num_regs_load
         else:
-            self.num_regs_reduce = 128 if self.use_2cta_instrs else 136
-            self.num_regs_compute = 144 if self.use_2cta_instrs else 144
-        self.num_regs_load = 96 if self.use_2cta_instrs else 96 - 8
-        self.num_regs_mma = 96 if self.use_2cta_instrs else self.num_regs_load
+            self.num_regs_reduce = 136 if self.use_2cta_instrs else 136
+            self.num_regs_compute = 136 if self.use_2cta_instrs else 144
+            self.num_regs_load = 104 if self.use_2cta_instrs else 96 - 8
+            self.num_regs_mma = 104 if self.use_2cta_instrs else self.num_regs_load
         self.num_regs_empty = 24
 
-        # if const_expr(self.tile_hdim == 192):
-        # if const_expr(self.use_2cta_instrs):
-        #     if not is_causal and not is_local:
-        #         self.num_regs_reduce = 128 + 16
-        #         self.num_regs_compute = 128 + 8
-        #         self.num_regs_other = 128 - 32
-        #     else:
-        #         self.num_regs_reduce = 128 + 8
-        #         self.num_regs_compute = 128 + 8
-        #         self.num_regs_other = 128 - 32
+        if const_expr(self.tile_hdim == 192):
+            if not is_causal and not is_local:
+                self.num_regs_reduce = 128 + 8
+                self.num_regs_compute = 128 + 8
+                self.num_regs_load = 128 - 24
+                self.num_regs_mma = self.num_regs_load
+            else:
+                self.num_regs_reduce = 128 + 8
+                self.num_regs_compute = 128 + 8
+                self.num_regs_load = 128 - 24
+                self.num_regs_mma = self.num_regs_load
 
-        self.num_regs_reduce = 128 + 8
-        self.num_regs_compute = 128 + 8
-        self.num_regs_other = 128 - 24
-        self.num_regs_load = self.num_regs_other
-        self.num_regs_mma = self.num_regs_other
+        # self.num_regs_reduce = 128
+        # self.num_regs_compute = 128 + 16
+        # self.num_regs_other = 128 - 32
+        # self.num_regs_load = self.num_regs_other
+        # self.num_regs_mma = self.num_regs_other
 
         print("num_regs_reduce = ", self.num_regs_reduce)
         print("num_regs_compute = ", self.num_regs_compute)
@@ -259,9 +262,14 @@ class FlashAttentionBackwardSm100:
             self.dQ_reduce_ncol = 24 if not self.is_causal else 32
             self.sdQaccum_stage = 2 if not self.is_causal else 1
         else:
-            self.dQ_reduce_ncol = 8 if self.use_2cta_instrs else 32
-            self.sdQaccum_stage = 4 if self.use_2cta_instrs else 64 // self.dQ_reduce_ncol
-            self.dQ_reduce_ncol_t2r = max(self.dQ_reduce_ncol, 16)
+            if self.use_2cta_instrs:
+                self.dQ_reduce_ncol = 8 if not self.is_causal else 32
+                self.sdQaccum_stage = 4 if not self.is_causal else 1
+                self.dQ_reduce_ncol_t2r = max(16, self.dQ_reduce_ncol)
+            else:
+                self.dQ_reduce_ncol = 32
+                self.sdQaccum_stage = 64 // self.dQ_reduce_ncol
+                self.dQ_reduce_ncol_t2r = self.dQ_reduce_ncol
         assert (self.tile_hdim // self.cta_group_size) % self.dQ_reduce_ncol == 0
         self.dQaccum_reduce_stage = self.tile_hdim // self.dQ_reduce_ncol
         self.dQaccum_reduce_stage_t2r = self.tile_hdim // self.dQ_reduce_ncol_t2r
@@ -800,29 +808,12 @@ class FlashAttentionBackwardSm100:
                 tmem_cluster_mbar_ptr: cutlass.Int64
                 dQaccum_empty_mbar_ptr: cutlass.Int64
 
-                sLSE: cute.struct.Align[
-                    cute.struct.MemRange[self.lse_dtype, cute.cosize(self.sLSE_layout)],
-                    128,
-                ]
-                sdPsum: cute.struct.Align[
-                    cute.struct.MemRange[self.dpsum_dtype, cute.cosize(self.sdPsum_layout)],
-                    128,
-                ]
-
                 sQ: cute.struct.Align[
                     cute.struct.MemRange[self.q_dtype, cute.cosize(self.sQ_layout)],
                     self.buffer_align_bytes,
                 ]
-                sQt: cute.struct.Align[
-                    cute.struct.MemRange[self.q_dtype, sQt_size],
-                    self.buffer_align_bytes,
-                ]
                 sK: cute.struct.Align[
                     cute.struct.MemRange[self.k_dtype, cute.cosize(self.sK_layout)],
-                    self.buffer_align_bytes,
-                ]
-                sKt: cute.struct.Align[
-                    cute.struct.MemRange[self.k_dtype, cute.cosize(self.sKt_layout)],
                     self.buffer_align_bytes,
                 ]
                 sV: cute.struct.Align[
@@ -833,21 +824,37 @@ class FlashAttentionBackwardSm100:
                     cute.struct.MemRange[self.do_dtype, cute.cosize(self.sdO_layout)],
                     self.buffer_align_bytes,
                 ]
+                sQt: cute.struct.Align[
+                    cute.struct.MemRange[self.q_dtype, sQt_size],
+                    self.buffer_align_bytes,
+                ]
                 sdOt: cute.struct.Align[
                     cute.struct.MemRange[self.do_dtype, sdOt_size],
+                    self.buffer_align_bytes,
+                ]
+                sdS_xchg: cute.struct.Align[
+                    cute.struct.MemRange[self.ds_dtype, sdS_xchg_size],
+                    self.buffer_align_bytes,
+                ]
+                sKt: cute.struct.Align[
+                    cute.struct.MemRange[self.k_dtype, cute.cosize(self.sKt_layout)],
                     self.buffer_align_bytes,
                 ]
                 sdS: cute.struct.Align[
                     cute.struct.MemRange[self.ds_dtype, cute.cosize(self.sdSt_layout)],
                     self.buffer_align_bytes,
                 ]
+                sLSE: cute.struct.Align[
+                    cute.struct.MemRange[self.lse_dtype, cute.cosize(self.sLSE_layout)],
+                    128,
+                ]
+                sdPsum: cute.struct.Align[
+                    cute.struct.MemRange[self.dpsum_dtype, cute.cosize(self.sdPsum_layout)],
+                    128,
+                ]
                 sdQaccum: cute.struct.Align[
                     cute.struct.MemRange[self.dqaccum_dtype, cute.cosize(self.sdQaccum_layout)],
-                    self.buffer_align_bytes,
-                ]
-                sdS_xchg: cute.struct.Align[
-                    cute.struct.MemRange[self.ds_dtype, sdS_xchg_size],
-                    self.buffer_align_bytes,
+                    self.buffer_align_bytes if sdS_xchg_size == 0 else 128,
                 ]
 
         else:
@@ -2087,14 +2094,6 @@ class FlashAttentionBackwardSm100:
                             load_Q(first_m_block, producer_state=producer_state_Q_LSE)
                             pipeline_Q.producer_commit(producer_state_Q_LSE)
 
-                            if const_expr(self.use_2cta_instrs):
-                                pipeline_Kt.producer_acquire(producer_state_Kt)
-                                load_Kt(
-                                    tma_bar_ptr=pipeline_Kt.producer_get_barrier(producer_state_Kt)
-                                )
-                                pipeline_Kt.producer_commit(producer_state_Kt)
-                                producer_state_Kt.advance()
-
                             # LSE
                             pipeline_LSE.producer_acquire(producer_state_Q_LSE)
                             with cute.arch.elect_one():
@@ -2119,9 +2118,9 @@ class FlashAttentionBackwardSm100:
                                     producer_state_dO_dPsum
                                 )
                             )
+                            load_dO(first_m_block, producer_state=producer_state_dO_dPsum)
                             if const_expr(tma_atom_dOt is not None):
                                 load_dOt(first_m_block, producer_state=producer_state_dO_dPsum)
-                            load_dO(first_m_block, producer_state=producer_state_dO_dPsum)
                             pipeline_dO.producer_commit(producer_state_dO_dPsum)
 
                             # dPsum
@@ -2136,6 +2135,11 @@ class FlashAttentionBackwardSm100:
                                 )
                             producer_state_dO_dPsum.advance()
 
+                        if const_expr(self.use_2cta_instrs):
+                            pipeline_Kt.producer_acquire(producer_state_Kt)
+                            load_Kt(tma_bar_ptr=pipeline_Kt.producer_get_barrier(producer_state_Kt))
+                            pipeline_Kt.producer_commit(producer_state_Kt)
+                            producer_state_Kt.advance()
                         #### Main Loop ####
                         for m_block in cutlass.range(m_block_min + 1, m_block_max, unroll=1):
                             if const_expr(should_load_Q):
@@ -2175,9 +2179,9 @@ class FlashAttentionBackwardSm100:
                                     if const_expr(tma_atom_dOt is not None)
                                     else 0,
                                 )
+                                load_dO(m_block, producer_state=producer_state_dO_dPsum)
                                 if const_expr(tma_atom_dOt is not None):
                                     load_dOt(m_block, producer_state=producer_state_dO_dPsum)
-                                load_dO(m_block, producer_state=producer_state_dO_dPsum)
                                 pipeline_dO.producer_commit(producer_state_dO_dPsum)
 
                                 # dPsum
