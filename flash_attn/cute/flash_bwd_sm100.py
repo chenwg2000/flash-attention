@@ -2483,7 +2483,7 @@ class FlashAttentionBackwardSm100:
                     pipeline_dKV.sync_object_empty.wait(1, producer_phase_dKV)
                     pipeline_dKV.sync_object_full.arrive(1, pipeline_dKV.producer_mask, cta_group)
                     producer_phase_dKV ^= 1
-            elif const_expr(False):
+            elif const_expr(self.use_2cta_instrs):
                 print("2cta hdim 128 mma path")
                 if is_leader_cta and process_tile:
                     accumulate_dK = False
@@ -2542,6 +2542,7 @@ class FlashAttentionBackwardSm100:
                         pipeline_Q.consumer_release(consumer_state_Q)
                         consumer_state_Q.advance()
 
+                        # pipeline_dS.consumer_wait(consumer_state_dS)
                         # (2) dK += dS.T @ Q (cur)
                         pipeline_Qt.consumer_wait(consumer_state_Qt)
                         pipeline_dP.sync_object_empty.wait(0, producer_phase_acc)  # dP -> dS
@@ -2560,15 +2561,10 @@ class FlashAttentionBackwardSm100:
                         cute.arch.mbarrier_wait(dS_cluster_leader_mbar_ptr, phase=dS_cluster_phase)
                         mma_dsk_fn()
                         pipeline_dQ.sync_object_full.arrive(0, pipeline_dQ.producer_mask, cta_group)
-                        dS_cluster_phase ^= 1
-                        producer_phase_dQ ^= 1
                         pipeline_dS.consumer_release(consumer_state_dS)
                         consumer_state_dS.advance()
-
-                        # (3) dP.T = V @ dO.T (next)
-                        # pipeline_dO.consumer_wait(consumer_state_dO)
-                        # mma_dov_fn(B_idx=consumer_state_dO.index)
-                        # pipeline_dP.sync_object_full.arrive(0, pipeline_dP.producer_mask, cta_group)
+                        dS_cluster_phase ^= 1
+                        producer_phase_dQ ^= 1
 
                         # (4) dV += P.T @ dO (next)
                         producer_phase_acc ^= 1
@@ -2587,6 +2583,7 @@ class FlashAttentionBackwardSm100:
                     # -----------------------------------------------------------
                     # Tail: Remaining dK and dQ
                     # -----------------------------------------------------------
+                    # pipeline_dS.consumer_wait(consumer_state_dS)
                     # dK += dS.T @ Q
                     pipeline_Qt.consumer_wait(consumer_state_Qt)
                     pipeline_dP.sync_object_empty.wait(0, producer_phase_acc)  # dP -> dS
@@ -2603,12 +2600,12 @@ class FlashAttentionBackwardSm100:
                     pipeline_dQ.sync_object_empty.wait(0, producer_phase_dQ)
                     mma_dsk_fn()
                     pipeline_dQ.sync_object_full.arrive(0, pipeline_dQ.producer_mask, cta_group)
+                    pipeline_dS.consumer_release(consumer_state_dS)
+                    pipeline_Kt.consumer_release(consumer_state_Kt)
+                    consumer_state_dS.advance()
+                    consumer_state_Kt.advance()
                     dS_cluster_phase ^= 1
                     producer_phase_dQ ^= 1
-                    pipeline_Kt.consumer_release(consumer_state_Kt)
-                    consumer_state_Kt.advance()
-                    pipeline_dS.consumer_release(consumer_state_dS)
-                    consumer_state_dS.advance()
 
                     producer_phase_acc ^= 1
             else:
@@ -2712,6 +2709,7 @@ class FlashAttentionBackwardSm100:
                                 dS_cluster_leader_mbar_ptr, phase=dS_cluster_phase
                             )
                             dS_cluster_phase ^= 1
+                            # wait on S tmem read
                         mma_dsk_fn()
                         pipeline_dQ.sync_object_full.arrive(0, pipeline_dQ.producer_mask, cta_group)
                         if const_expr(self.use_2cta_instrs):
@@ -3142,6 +3140,12 @@ class FlashAttentionBackwardSm100:
                     cute.arch.fence_view_async_tmem_load()
                     with cute.arch.elect_one():
                         pipeline_S_P.consumer_release(consumer_state_S_P_dP)
+                elif const_expr(self.use_2cta_instrs and self.tile_hdim <= 128):
+                    if iter_idx > 0:
+                        cute.arch.fence_view_async_tmem_load()
+                        with cute.arch.elect_one():
+                            pipeline_dS.producer_commit(producer_state_dS)
+                        producer_state_dS.advance()
 
                 if const_expr(self.score_mod_bwd is not None):
                     tSrS_pre = cute.make_fragment_like(tSrS_t2r)
@@ -3316,14 +3320,12 @@ class FlashAttentionBackwardSm100:
                 if const_expr(not self.use_smem_dS_for_mma_dK):
                     cute.arch.fence_view_async_tmem_store()
 
-                if const_expr(self.tile_hdim == 192):
+                # if const_expr(self.tile_hdim == 192):
+                if const_expr(self.use_2cta_instrs):
                     # use pipeline_dP to signal tmem store of dS
                     with cute.arch.elect_one():
                         pipeline_dP.consumer_release(consumer_state_S_P_dP)
                 consumer_state_S_P_dP.advance()
-
-                pipeline_dPsum.consumer_release(consumer_state_dPsum)
-                consumer_state_dPsum.advance()
 
                 # After the loop: copy exchange registers to sdS_xchg buffer
                 if const_expr(self.use_2cta_instrs):
@@ -3335,11 +3337,12 @@ class FlashAttentionBackwardSm100:
 
                 cute.arch.fence_view_async_shared()
                 self.compute_sync_barrier.arrive_and_wait()
-                # pipeline_dPsum.consumer_release(consumer_state_dPsum)
-                # consumer_state_dPsum.advance()
-                with cute.arch.elect_one():
-                    pipeline_dS.producer_commit(producer_state_dS)
-                producer_state_dS.advance()
+                pipeline_dPsum.consumer_release(consumer_state_dPsum)
+                consumer_state_dPsum.advance()
+                if const_expr(not (self.use_2cta_instrs and self.tile_hdim <= 128)):
+                    with cute.arch.elect_one():
+                        pipeline_dS.producer_commit(producer_state_dS)
+                    producer_state_dS.advance()
 
                 # 2-CTA: DSMEM copy from sdS_xchg to peer's sdS buffer
                 if const_expr(self.use_2cta_instrs):
@@ -3362,6 +3365,11 @@ class FlashAttentionBackwardSm100:
                             stage_copy_bytes,
                             peer_cta_rank_in_cluster=peer_cta_rank_in_cluster,
                         )
+
+            if const_expr(self.use_2cta_instrs and self.tile_hdim <= 128):
+                with cute.arch.elect_one():
+                    pipeline_dS.producer_commit(producer_state_dS)
+                producer_state_dS.advance()
 
             # Epilogue
             # Run epilogue if we processed any m_blocks for this n_block
