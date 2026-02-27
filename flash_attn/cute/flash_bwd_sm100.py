@@ -250,9 +250,9 @@ class FlashAttentionBackwardSm100:
             self.sdQaccum_stage = 2 if not self.is_causal else 1
         else:
             if self.use_2cta_instrs:
-                self.dQ_reduce_ncol = 8 if not self.is_causal else 32
-                self.sdQaccum_stage = 4 if not self.is_causal else 1
-                self.dQ_reduce_ncol_t2r = max(16, self.dQ_reduce_ncol)
+                self.dQ_reduce_ncol = 16 if self.deterministic else 8
+                self.sdQaccum_stage = 2 if self.deterministic else 4
+                self.dQ_reduce_ncol_t2r = 32
             else:
                 self.dQ_reduce_ncol = 32
                 self.sdQaccum_stage = 64 // self.dQ_reduce_ncol
@@ -3494,7 +3494,8 @@ class FlashAttentionBackwardSm100:
             if const_expr(self.deterministic):
                 mdQ_semaphore_cur = mdQ_semaphore[None, None, head_idx, batch_idx]
 
-            delay_semaphore_release = self.is_causal and not self.use_2cta_instrs
+            # delay_semaphore_release = self.is_causal and not self.tile_hdim == 192
+            delay_semaphore_release = not self.tile_hdim == 192
 
             # some tiles might be empty due to block sparsity
             if const_expr(self.use_block_sparsity):
@@ -3612,7 +3613,7 @@ class FlashAttentionBackwardSm100:
                                 1,
                             )
 
-                if const_expr(self.use_2cta_instrs and self.tile_hdim == 192):
+                if const_expr(self.tile_hdim == 192):
                     if const_expr(self.sdQaccum_stage > 1):
                         if is_tma_warp:
                             cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
@@ -3623,7 +3624,7 @@ class FlashAttentionBackwardSm100:
                 # semaphore release
                 # NOTE: arrive_inc calls red_release which issues membar
                 if const_expr(self.deterministic and not delay_semaphore_release):
-                    if const_expr(self.sdQaccum_stage > 1 and not self.use_2cta_instrs):
+                    if const_expr(self.sdQaccum_stage > 1 and not self.tile_hdim == 192):
                         if is_tma_warp:
                             cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
                         self.reduce_sync_barrier.arrive_and_wait()
