@@ -2153,12 +2153,6 @@ class FlashAttentionBackwardSm100:
                                     )
                                 producer_state_Q_LSE.advance()
 
-                                # if const_expr(tma_atom_Qt is not None):
-                                #     pipeline_Qt.producer_acquire(producer_state_Qt)
-                                #     load_Qt(m_block - 1, producer_state=producer_state_Qt)
-                                #     pipeline_Qt.producer_commit(producer_state_Qt)
-                                #     producer_state_Qt.advance()
-
                             if const_expr(should_load_dO):
                                 pipeline_dO.producer_acquire(
                                     producer_state_dO_dPsum,
@@ -3064,12 +3058,15 @@ class FlashAttentionBackwardSm100:
                 tSrS_t2r = cute.make_fragment(tScS_t2r.shape, Float32)
                 cute.copy(thr_copy_t2r, tStS_t2r, tSrS_t2r)
 
-                # For hdim 192, we use pipeline S_P to signal S tmem read instead
                 if const_expr(self.tile_hdim == 192):
+                    # Signal S tmem load completion using pipeline_S_P when hdim 192
+                    # dP is overlapped with S
                     cute.arch.fence_view_async_tmem_load()
                     with cute.arch.elect_one():
                         pipeline_S_P.consumer_release(consumer_state_S_P_dP)
                 elif const_expr(self.use_2cta_instrs and self.tile_hdim <= 128):
+                    # Signal S tmem load completion using pipeline_dS when 2cta hdim 128
+                    # dQ is overlapped with S
                     if iter_idx > 0:
                         cute.arch.fence_view_async_tmem_load()
                         with cute.arch.elect_one():
@@ -3150,6 +3147,7 @@ class FlashAttentionBackwardSm100:
                 cute.arch.fence_view_async_tmem_store()
                 self.compute_sync_barrier.arrive_and_wait()
                 if const_expr(not self.tile_hdim == 192):
+                    # Signal tmem store P completion with pipeline_S_P
                     with cute.arch.elect_one():
                         pipeline_S_P.consumer_release(consumer_state_S_P_dP)
                         # pipeline_S_P.sync_object_empty.arrive(0, pipeline_S_P.consumer_mask)
@@ -3164,9 +3162,6 @@ class FlashAttentionBackwardSm100:
                 ### Now delayed to after loop
                 # consumer_state_S_P_dP.advance()
                 # consumer_phase_S_P_dP ^= 1
-                # if const_expr(self.use_2cta_instrs):
-                #     cute.arch.mbarrier_wait(dS_cluster_empty_mbar_ptr, phase=dS_cluster_empty_phase)
-                #     dS_cluster_empty_phase ^= 1
 
                 ##### dS.T = P.T * (dP.T - Psum)
                 for stage in cutlass.range_constexpr(num_stages):
@@ -3249,7 +3244,6 @@ class FlashAttentionBackwardSm100:
                 if const_expr(not self.use_smem_dS_for_mma_dK):
                     cute.arch.fence_view_async_tmem_store()
 
-                # if const_expr(self.tile_hdim == 192):
                 if const_expr(self.use_2cta_instrs):
                     # use pipeline_dP to signal tmem store of dS
                     with cute.arch.elect_one():
@@ -3258,6 +3252,7 @@ class FlashAttentionBackwardSm100:
 
                 # After the loop: copy exchange registers to sdS_xchg buffer
                 if const_expr(self.use_2cta_instrs):
+                    # when hdim 192, sdQaccum overlapped with sdS_xchg
                     if const_expr(self.tile_hdim == 192):
                         cute.arch.mbarrier_wait(
                             dQaccum_empty_mbar_ptr, phase=producer_state_dS.phase
@@ -3268,7 +3263,8 @@ class FlashAttentionBackwardSm100:
                 self.compute_sync_barrier.arrive_and_wait()
                 pipeline_dPsum.consumer_release(consumer_state_dPsum)
                 consumer_state_dPsum.advance()
-                if const_expr(not (self.use_2cta_instrs and self.tile_hdim <= 128)):
+                # when 2cta hdim 128, pipeline_dS also signals S tmem load completion so is deferred
+                if const_expr(not (self.use_2cta_instrs and self.tile_hdim == 128)):
                     with cute.arch.elect_one():
                         pipeline_dS.producer_commit(producer_state_dS)
                     producer_state_dS.advance()
@@ -3295,7 +3291,8 @@ class FlashAttentionBackwardSm100:
                             peer_cta_rank_in_cluster=peer_cta_rank_in_cluster,
                         )
 
-            if const_expr(self.use_2cta_instrs and self.tile_hdim <= 128):
+            # Final signal for dS smem store completion
+            if const_expr(self.use_2cta_instrs and self.tile_hdim == 128):
                 with cute.arch.elect_one():
                     pipeline_dS.producer_commit(producer_state_dS)
                 producer_state_dS.advance()
