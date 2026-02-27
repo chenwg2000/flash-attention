@@ -339,14 +339,21 @@ struct CollectiveMainloopFwdSm120 {
                 a.window_size_left, a.window_size_right, a.seqlen_q, a.seqlen_k};
     }
 
+    /// Load scale factors from GMEM (row-major) to SMEM (block-scaled interleaved format).
+    /// Block-scaled SMEM layout: groups of 32 rows interleaved with stride 16.
+    /// SMEM_offset(row, col) = (row % 32) * 16 + (row / 32) * 4 + col
     CUTLASS_DEVICE static void load_sf(uint8_t* dst, uint8_t const* src,
         int rows, int cols, index_t stride, int row_off, int tid, int nthreads) {
         if (src == nullptr) {
             for (int i = tid; i < rows*cols; i += nthreads) { dst[i] = 127; }
             return;
         }
-        for (int i = tid; i < rows*cols; i += nthreads) {
-            dst[i] = src[(row_off + i/cols)*stride + i%cols];
+        int total = rows * cols;
+        for (int i = tid; i < total; i += nthreads) {
+            int r = i / cols;
+            int c = i % cols;
+            int smem_off = (r % 32) * 16 + (r / 32) * 4 + c;
+            dst[smem_off] = src[(row_off + r) * stride + c];
         }
     }
 
