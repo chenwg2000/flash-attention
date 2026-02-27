@@ -170,6 +170,20 @@ For causal attention:
 - Only 1 block per M-row needs masking; remaining blocks are fully valid
 - **Causal performance: 172 -> 290 TFLOPS (+68%)**
 
+### Phase 6: MXFP8 API + Scale Factor Fix
+- **Wired `flash_attn_mxfp8_func`** to the kernel via a dedicated `fwd_mxfp8` C++ op
+  - Lean entry point: Q/K/V (FP8) + q_scale/k_scale/v_scale (UE8M0) + softmax_scale + causal
+  - Registered as `flash_attn_3.fwd_mxfp8` via `STABLE_TORCH_LIBRARY`
+  - Populates `Flash_fwd_params` scale pointers and strides
+- **Fixed scale factor SMEM layout** to match CUTLASS block-scaled interleaved format
+  - `load_sf` was writing row-major but MMA partition reads in `SfKMajorAtom` format
+  - Correct formula: `SMEM_offset(row, col) = (row % 32) * 16 + (row / 32) * 4 + col`
+  - This interleaving comes from `Shape<32,4> Stride<16,4>` in the CUTLASS block-scaled atom
+  - With identity scales (all 127) the bug was harmless; non-uniform scales were scrambled
+- **Verified with non-identity scales** (2^-3 to 2^4 per block):
+  - Correct scales: LSE diff = 0.000006 vs dequantized reference
+  - Identity scales: LSE diff = 33.19 vs scaled reference (proves scales take effect)
+
 ---
 
 ## 5. Performance Results
@@ -183,6 +197,7 @@ For causal attention:
 | Output Correctness (non-causal) | PASS | O max diff = 0.013 at s=256; scales with seqlen due to FP8 accumulation |
 | Identity Attention | PASS | O diff = 0.0001, LSE diff = 0.0000 |
 | Causal Correctness | PASS | LSE exact match; O diff higher for early rows (few valid K-positions amplify FP8 error) |
+| MXFP8 Scale Factors | PASS | Non-identity scales: LSE diff = 0.000006 vs dequantized reference |
 
 ### Performance (median of 100 runs)
 
@@ -241,12 +256,46 @@ Replacing `UniversalCopy<uint8_t>` with LDSM (`SM75_U32x{2,4}_LDSM_N`) required:
 - **`partition_fragment_A/B` with flat layout**: Register fragments depend only on tile shape, not swizzle; using a flat (non-swizzled) layout avoids composed-layout issues in the MMA partition.
 - **B-operand uses U32x2**: With 8x1x1 warp layout, the B-operand tile is only 8x32 = 256 bytes = 8 bytes/thread, requiring `SM75_U32x2_LDSM_N` instead of `SM75_U32x4_LDSM_N`.
 
+### Scale Factor SMEM Layout (Block-Scaled Interleaving)
+CUTLASS's block-scaled MMA expects scale factors in an interleaved SMEM format, not simple row-major. The `SfKMajorAtom` layout uses `Shape<32,4> Stride<16,4>`, which interleaves 4 groups of 32 rows:
+```
+SMEM_offset(row, col) = (row % 32) * 16 + (row / 32) * 4 + col
+```
+Row 0 at offset 0, row 1 at 16, ..., row 31 at 496, row 32 at 4, row 33 at 20, etc. This packs scale factors from 4 row-groups into each 16-byte SMEM block for efficient MMA access. The `load_sf` cooperative load must write to these interleaved positions rather than sequential row-major order.
+
 ### ODR-Use of Static Constexpr in Device Code
 `static constexpr int kStages` triggers undefined symbol errors in CUDA device code on certain compiler configurations. Resolved by copying to a local variable: `int const num_stages = kStages_;`.
 
 ---
 
-## 7. Remaining Optimization Opportunities
+## 7. Python API
+
+```python
+from flash_attn_interface import flash_attn_mxfp8_func
+
+# FP8 data + MXFP8 per-32-element UE8M0 scale factors
+out, lse = flash_attn_mxfp8_func(
+    q,          # (batch, seqlen_q, nheads, headdim), float8_e4m3fn
+    k,          # (batch, seqlen_k, nheads_kv, headdim), float8_e4m3fn
+    v,          # (batch, seqlen_k, nheads_kv, headdim), float8_e4m3fn
+    q_scale,    # (batch, nheads, seqlen_q, headdim//32), uint8 UE8M0
+    k_scale,    # (batch, nheads_kv, seqlen_k, headdim//32), uint8 UE8M0
+    v_scale,    # (batch, nheads_kv, seqlen_k, headdim//32), uint8 UE8M0
+    softmax_scale=1.0 / math.sqrt(headdim),
+    causal=True,
+)
+# out: (batch, seqlen_q, nheads, headdim) bfloat16
+# lse: (batch, nheads, seqlen_q) float32
+
+# For identity scales (plain FP8, no block scaling):
+sf = torch.full((batch, nheads, seqlen, headdim // 32), 127, dtype=torch.uint8, device='cuda')
+```
+
+For training integration, wrap in `torch.autograd.Function` with a BF16 backward fallback (the kernel is forward-only).
+
+---
+
+## 8. Remaining Optimization Opportunities
 
 | Optimization | Expected Impact | Difficulty |
 |-------------|-----------------|------------|
@@ -258,7 +307,7 @@ Replacing `UniversalCopy<uint8_t>` with LDSM (`SM75_U32x{2,4}_LDSM_N`) required:
 
 ---
 
-## 8. Files Modified/Created
+## 9. Files Modified/Created
 
 ### New Files
 | File | Purpose |
@@ -278,12 +327,12 @@ Replacing `UniversalCopy<uint8_t>` with LDSM (`SM75_U32x{2,4}_LDSM_N`) required:
 | `hopper/flash.h` | MXFP8 scale factor fields in `Flash_fwd_params` |
 | `hopper/static_switch.h` | `Arch==120` dispatch case |
 | `hopper/utils.h` | `enable_sm120_or_later` architecture guard |
-| `hopper/flash_api_stable.cpp` | SM120 dispatch in `run_mha_fwd_constexpr` |
-| `hopper/flash_attn_interface.py` | `flash_attn_mxfp8_func` Python interface |
+| `hopper/flash_api_stable.cpp` | SM120 dispatch + `mha_fwd_mxfp8` C++ op + `fwd_mxfp8` registration |
+| `hopper/flash_attn_interface.py` | `flash_attn_mxfp8_func` wired to `flash_attn_3_gpu.fwd_mxfp8()` |
 
 ---
 
-## 9. Build Command Reference
+## 10. Build Command Reference
 
 ```bash
 cd /home/nanogpt/prj/fp8_flashattention/flash-attention/hopper
