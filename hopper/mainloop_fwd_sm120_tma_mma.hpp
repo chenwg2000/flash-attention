@@ -445,7 +445,11 @@ struct CollectiveMainloopFwdSm120 {
     {
         int const block_n = kBlockN;
         int const m_start = m_block * kBlockM;
-        int const n_block_max = cute::ceil_div(p.seqlen_k, block_n);
+        int n_block_max = cute::ceil_div(p.seqlen_k, block_n);
+        // Causal: skip N-blocks that are entirely above the diagonal
+        if constexpr (Is_causal) {
+            n_block_max = cute::min(n_block_max, cute::ceil_div(m_start + kBlockM, block_n));
+        }
 
         TiledMma tiled_mma;
         auto thread_mma = tiled_mma.get_thread_slice(tid);
@@ -583,6 +587,34 @@ struct CollectiveMainloopFwdSm120 {
             if constexpr (Has_softcap) {
                 for (int i = 0; i < size(acc_s); ++i)
                     acc_s(i) = cutlass::fast_tanh(acc_s(i) * p.softcap_val);
+            }
+
+            // ====== Causal mask: set future positions to -inf ======
+            if constexpr (Is_causal) {
+                // Only the diagonal block (n_start >= m_start) has partially masked positions.
+                // All blocks with n_start < m_start are fully below the diagonal.
+                if (n_start >= m_start) {
+                    Tensor acc_s_rc = make_tensor(acc_s.data(),
+                        flash::convert_layout_acc_rowcol(acc_s.layout()));
+                    int const warp_m = tid / 32;
+                    int const lane_row = (tid % 32) / 4;
+                    int const lane_col = (tid % 32) % 4;
+                    #pragma unroll
+                    for (int mi = 0; mi < size<0>(acc_s_rc); ++mi) {
+                        int const row = m_start + warp_m * 16
+                            + (mi / 2) * 16 + lane_row + (mi % 2) * 8;
+                        #pragma unroll
+                        for (int ni = 0; ni < size<1>(acc_s_rc); ni += 2) {
+                            int const col = n_start + (ni / 2) * 8 + lane_col * 2;
+                            if (col > row) {
+                                acc_s_rc(mi, ni)     = -INFINITY;
+                                acc_s_rc(mi, ni + 1) = -INFINITY;
+                            } else if (col + 1 > row) {
+                                acc_s_rc(mi, ni + 1) = -INFINITY;
+                            }
+                        }
+                    }
+                }
             }
 
             // ====== Online softmax ======
