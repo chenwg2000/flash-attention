@@ -50,7 +50,7 @@ struct Flash_fwd_params : public Qkv_params {
     void * __restrict__ softmax_lse_ptr;
     void * __restrict__ softmax_lseaccum_ptr;
 
-    // For FP8 scaling
+    // For FP8 scaling (per-head descale, FA3 SM90)
     float * __restrict__ q_descale_ptr;
     float * __restrict__ k_descale_ptr;
     float * __restrict__ v_descale_ptr;
@@ -60,6 +60,22 @@ struct Flash_fwd_params : public Qkv_params {
     index_t k_descale_head_stride;
     index_t v_descale_batch_stride;
     index_t v_descale_head_stride;
+
+    // For MXFP8 block-scaled MMA (SM120)
+    // Scale factors are UE8M0 (unsigned 8-bit exponent, no mantissa)
+    // One scale per 32-element block along the K/inner dimension
+    void * __restrict__ q_scale_ptr;   // [batch, head, seqlen_q, ceil(d/32)]
+    void * __restrict__ k_scale_ptr;   // [batch, head_kv, seqlen_k, ceil(d/32)]
+    void * __restrict__ v_scale_ptr;   // [batch, head_kv, seqlen_k, ceil(d_v/32)]
+    index_t q_scale_batch_stride;
+    index_t q_scale_head_stride;
+    index_t q_scale_row_stride;
+    index_t k_scale_batch_stride;
+    index_t k_scale_head_stride;
+    index_t k_scale_row_stride;
+    index_t v_scale_batch_stride;
+    index_t v_scale_head_stride;
+    index_t v_scale_row_stride;
 
     // The dimensions.
     int b, seqlen_q, seqlen_k, seqlen_knew, d, seqlen_q_rounded, seqlen_k_rounded, d_rounded, rotary_dim;
@@ -222,3 +238,7 @@ template <int Arch, typename T, int kHeadDim, bool Has_softcap>
 void run_mha_bwd_(Flash_bwd_params &params, cudaStream_t stream);
 template <typename T, typename Tpartial, int kBlockK>
 void run_mha_fwd_combine_(Flash_fwd_params &params, cudaStream_t stream, bool enable_pdl);
+
+// SM120 MXFP8 block-scaled forward pass
+template <typename T, int kHeadDim>
+void run_mha_fwd_sm120_(Flash_fwd_params &params, cudaStream_t stream);

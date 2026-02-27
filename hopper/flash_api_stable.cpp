@@ -319,6 +319,28 @@ void set_params_dgrad(Flash_bwd_params &params,
 
 template <int Arch, int Split, bool PagedKVNonTMA, bool PackGQA, bool Has_softcap>
 void run_mha_fwd_constexpr(Flash_fwd_params &params, cudaStream_t stream) {
+    // SM120: MXFP8 block-scaled path (FP8 only, forward only)
+    if constexpr (Arch == 120) {
+        if (params.is_e4m3) {
+            #ifndef FLASHATTENTION_DISABLE_FP8
+            #ifndef FLASHATTENTION_DISABLE_HDIM64
+            if (params.d <= 64) { return run_mha_fwd_sm120_<cutlass::float_e4m3_t, 64>(params, stream); }
+            #endif
+            #ifndef FLASHATTENTION_DISABLE_HDIM128
+            if (params.d <= 128) { return run_mha_fwd_sm120_<cutlass::float_e4m3_t, 128>(params, stream); }
+            #endif
+            #ifndef FLASHATTENTION_DISABLE_HDIM256
+            if (params.d <= 256) { return run_mha_fwd_sm120_<cutlass::float_e4m3_t, 256>(params, stream); }
+            #endif
+            #else
+            STD_TORCH_CHECK(false, "This flash attention build does not support FP8.");
+            #endif
+        } else {
+            // SM120 currently only supports FP8; fall through to SM90 path for FP16/BF16
+            STD_TORCH_CHECK(false, "SM120 MXFP8 path only supports FP8 e4m3. Use FP8 tensors with scale factors.");
+        }
+        return;
+    }
     if (!params.is_e4m3) {
         if (params.is_bf16) {
             #ifndef FLASHATTENTION_DISABLE_HDIM64

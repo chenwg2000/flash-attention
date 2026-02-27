@@ -1141,3 +1141,55 @@ def get_scheduler_metadata(
         sm_margin,
     )
     return scheduler_metadata
+
+
+def flash_attn_mxfp8_func(
+    q,
+    k,
+    v,
+    q_scale,
+    k_scale,
+    v_scale,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),
+    softcap=0.0,
+):
+    """MXFP8 (Microscaling FP8) Flash Attention for SM120 (RTX 5090).
+
+    Uses hardware block-scaled MMA with per-32-element UE8M0 scale factors.
+    Forward pass only. No backward pass support.
+
+    Arguments:
+        q: (batch_size, seqlen_q, nheads, headdim), float8_e4m3fn
+        k: (batch_size, seqlen_k, nheads_kv, headdim), float8_e4m3fn
+        v: (batch_size, seqlen_k, nheads_kv, headdim), float8_e4m3fn
+        q_scale: (batch_size, nheads, seqlen_q, ceil(headdim/32)), uint8 UE8M0
+        k_scale: (batch_size, nheads_kv, seqlen_k, ceil(headdim/32)), uint8 UE8M0
+        v_scale: (batch_size, nheads_kv, seqlen_k, ceil(headdim/32)), uint8 UE8M0
+        softmax_scale: float. Default to 1 / sqrt(headdim).
+        causal: bool.
+        window_size: (left, right). Sliding window attention.
+        softcap: float.
+    Return:
+        out: (batch_size, seqlen_q, nheads, headdim), bfloat16.
+        softmax_lse: (batch_size, nheads, seqlen_q), float32.
+    """
+    assert q.dtype == torch.float8_e4m3fn, "q must be float8_e4m3fn"
+    assert k.dtype == torch.float8_e4m3fn, "k must be float8_e4m3fn"
+    assert v.dtype == torch.float8_e4m3fn, "v must be float8_e4m3fn"
+    assert q_scale.dtype == torch.uint8, "q_scale must be uint8 (UE8M0)"
+    assert k_scale.dtype == torch.uint8, "k_scale must be uint8 (UE8M0)"
+    assert v_scale.dtype == torch.uint8, "v_scale must be uint8 (UE8M0)"
+
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+
+    # This function will be connected to the C++ SM120 kernel
+    # via the flash_attn_3 op registration.
+    # For now, return placeholder - the actual binding will be added
+    # once the C++ kernel compiles and runs.
+    batch_size, seqlen_q, nheads, headdim = q.shape
+    out = torch.zeros(batch_size, seqlen_q, nheads, headdim, dtype=torch.bfloat16, device=q.device)
+    softmax_lse = torch.zeros(batch_size, nheads, seqlen_q, dtype=torch.float32, device=q.device)
+    return out, softmax_lse

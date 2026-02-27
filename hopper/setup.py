@@ -196,6 +196,8 @@ def _write_ninja_file(path,
         flags.append(f'cuda_post_cflags_sm80_sm90 = {" ".join(cuda_post_cflags_sm80_sm90)}')
         cuda_post_cflags_sm100 = [s if s != 'arch=compute_90a,code=sm_90a' else 'arch=compute_100a,code=sm_100a' for s in cuda_post_cflags]
         flags.append(f'cuda_post_cflags_sm100 = {" ".join(cuda_post_cflags_sm100)}')
+        cuda_post_cflags_sm120 = [s if s != 'arch=compute_90a,code=sm_90a' else 'arch=compute_120a,code=sm_120a' for s in cuda_post_cflags]
+        flags.append(f'cuda_post_cflags_sm120 = {" ".join(cuda_post_cflags_sm120)}')
     flags.append(f'cuda_dlink_post_cflags = {" ".join(cuda_dlink_post_cflags)}')
     flags.append(f'ldflags = {" ".join(ldflags)}')
 
@@ -236,6 +238,9 @@ def _write_ninja_file(path,
         cuda_compile_rule_sm100 = ['rule cuda_compile_sm100'] + cuda_compile_rule[1:] + [
             f'  command = $nvcc_from_env {nvcc_gendeps} $cuda_cflags -c $in -o $out $cuda_post_cflags_sm100'
         ]
+        cuda_compile_rule_sm120 = ['rule cuda_compile_sm120'] + cuda_compile_rule[1:] + [
+            f'  command = $nvcc_from_env {nvcc_gendeps} $cuda_cflags -c $in -o $out $cuda_post_cflags_sm120'
+        ]
         cuda_compile_rule.append(
             f'  command = $nvcc_from_env {nvcc_gendeps} $cuda_cflags -c $in -o $out $cuda_post_cflags')
 
@@ -250,6 +255,8 @@ def _write_ninja_file(path,
                 rule = 'cuda_compile_sm80'
             elif source_file.endswith('_sm100.cu'):
                 rule = 'cuda_compile_sm100'
+            elif source_file.endswith('_sm120.cu'):
+                rule = 'cuda_compile_sm120'
             else:
                 rule = 'cuda_compile_sm80_sm90'
         else:
@@ -296,6 +303,7 @@ def _write_ninja_file(path,
         blocks.append(cuda_compile_rule_sm80)  # type: ignore[possibly-undefined]
         blocks.append(cuda_compile_rule_sm80_sm90)  # type: ignore[possibly-undefined]
         blocks.append(cuda_compile_rule_sm100)  # type: ignore[possibly-undefined]
+        blocks.append(cuda_compile_rule_sm120)  # type: ignore[possibly-undefined]
     blocks += [devlink_rule, link_rule, build, devlink, link, default]
     content = "\n\n".join("\n".join(b) for b in blocks)
     # Ninja requires a new lines at the end of the .ninja file
@@ -574,7 +582,18 @@ if not SKIP_CUDA_BUILD:
     if DISABLE_BACKWARD:
         sources_bwd_sm90 = []
         sources_bwd_sm80 = []
-    
+
+    # SM120 (Blackwell consumer / RTX 5090) - FP8 block-scaled MMA only
+    DTYPE_FWD_SM120 = ["e4m3"] if not DISABLE_FP8 else []
+    HEAD_DIMENSIONS_FWD_SM120 = (
+        []
+        + ([64] if not DISABLE_HDIM64 else [])
+        + ([128] if not DISABLE_HDIM128 else [])
+        + ([256] if not DISABLE_HDIM256 else [])
+    )
+    sources_fwd_sm120 = [f"instantiations/flash_fwd_hdim{hdim}_{dtype}_sm120.cu"
+                         for hdim, dtype in itertools.product(HEAD_DIMENSIONS_FWD_SM120, DTYPE_FWD_SM120)]
+
     # Choose between flash_api.cpp and flash_api_stable.cpp based on torch version
     torch_version = parse(torch.__version__)
     target_version = parse("2.9.0.dev20250830")
@@ -588,7 +607,7 @@ if not SKIP_CUDA_BUILD:
 
     sources = (
         [flash_api_source]
-        + (sources_fwd_sm80 if not DISABLE_SM8x else []) + sources_fwd_sm90
+        + (sources_fwd_sm80 if not DISABLE_SM8x else []) + sources_fwd_sm90 + sources_fwd_sm120
         + (sources_bwd_sm80 if not DISABLE_SM8x else []) + sources_bwd_sm90
     )
     if not DISABLE_SPLIT:

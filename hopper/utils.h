@@ -53,6 +53,16 @@ struct enable_sm80_to_sm89 : Kernel {
     }
 };
 
+template <typename Kernel>
+struct enable_sm120_or_later : Kernel {
+    template <typename... Args>
+    CUTLASS_DEVICE void operator()(Args&&... args) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1200)
+        Kernel::operator()(std::forward<Args>(args)...);
+#endif
+    }
+};
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template<typename T>
