@@ -464,18 +464,22 @@ struct CollectiveMainloopFwdSm120 {
                 softmax.template online_softmax<false>(acc_s);
             }
 
-            // ====== GEMM-II: O += P @ V (FP8/FP32 reference implementation) ======
-            // Step 1: Store P as FP8 to SMEM at correct (row, col) positions
+            // ====== GEMM-II: O += P @ V (block-scaled MMA) ======
+            // P[kBlockM, kBlockN] is the A-operand (attention weights)
+            // V^T[kHeadDim, kBlockN] is the B-operand (transposed values)
+            // K-dim of GEMM-II = kBlockN, same as GEMM-I since all dims = 128
+
+            // Step 1: Convert P from FP32 to FP8 and store to SMEM
             {
                 Tensor tOrP = make_tensor_like<Element>(acc_s);
                 flash::convert_type_out(acc_s, tOrP);
 
-                // 8x1 layout: warp_m = warp_idx, warp_n = 0
-                int const warp_idx = tid / 32;
-                int const lane_idx = tid % 32;
-                int const warp_m = warp_idx;  // 0..7
-                int const lane_row = lane_idx / 4;
-                int const lane_col = lane_idx % 4;
+                // Scatter P to correct (row, col) positions in SMEM
+                int const warp_idx_l = tid / 32;
+                int const lane_idx_l = tid % 32;
+                int const warp_m_l = warp_idx_l;  // 8x1: all warps along M
+                int const lane_row_l = lane_idx_l / 4;
+                int const lane_col_l = lane_idx_l % 4;
 
                 Tensor tOrP_rc = make_tensor(tOrP.data(),
                     flash::convert_layout_acc_rowcol(tOrP.layout()));
@@ -483,50 +487,80 @@ struct CollectiveMainloopFwdSm120 {
                 auto* p_smem = s.smem_p.data();
                 #pragma unroll
                 for (int mi = 0; mi < size<0>(tOrP_rc); ++mi) {
-                    int const row = warp_m * 16 + (mi / 2) * 16 + lane_row + (mi % 2) * 8;
+                    int const row = warp_m_l * 16 + (mi / 2) * 16 + lane_row_l + (mi % 2) * 8;
                     #pragma unroll
                     for (int ni = 0; ni < size<1>(tOrP_rc); ++ni) {
-                        int const col = (ni / 2) * 8 + lane_col * 2 + (ni % 2);
-                        if (row < kBlockM && col < kBlockN) {
-                            p_smem[row * kBlockN + col] = reinterpret_cast<uint8_t const&>(tOrP_rc(mi, ni));
-                        }
+                        int const col = (ni / 2) * 8 + lane_col_l * 2 + (ni % 2);
+                        p_smem[row * kBlockN + col] = reinterpret_cast<uint8_t const&>(tOrP_rc(mi, ni));
                     }
                 }
             }
+
+            // Step 2: Transpose V in SMEM: [kBlockN, kHeadDim] -> V^T[kHeadDim, kBlockN]
+            // smem_vt aliases smem_k (safe: K consumed by GEMM-I)
+            __syncthreads();
+            transpose_v_smem(
+                s.smem_v.data() + stg * kBlockN * kHeadDim,
+                s.smem_vt.data(),
+                tid, NumMmaThreads);
+
+            // Step 3: Fill identity scale factors for P and V^T
+            // smem_sfp aliases smem_sfk, smem_sfvt aliases smem_sfv (safe: consumed by GEMM-I)
+            fill_identity_sf(s.smem_sfp.data(), cute::cosize_v<SmemLayoutAtomSFP>, tid, NumMmaThreads);
+            fill_identity_sf(s.smem_sfvt.data(), cute::cosize_v<SmemLayoutAtomSFVt>, tid, NumMmaThreads);
             __syncthreads();
 
-            // Step 2: Compute O += P @ V in FP32 (dequantize both P and V on the fly)
-            {
-                int const warp_idx = tid / 32;
-                int const lane_idx = tid % 32;
-                int const warp_m = warp_idx;  // 0..7
-                int const lane_row = lane_idx / 4;
-                int const lane_col = lane_idx % 4;
+            // Step 4: Partition P from SMEM as GEMM-II A-operand
+            Tensor sP = make_tensor(make_smem_ptr(s.smem_p.data()), SmemLayoutP{});
+            Tensor tCrP = thread_mma.partition_fragment_A(sP);
+            auto copy_P_A = make_tiled_copy_A(SmemCopyAtomA{}, tiled_mma);
+            auto thr_copy_P = copy_P_A.get_thread_slice(tid);
+            Tensor tCsP = thr_copy_P.partition_S(sP);
+            Tensor tCrP_v = thr_copy_P.retile_D(tCrP);
 
-                auto const* p_smem = s.smem_p.data();
-                auto const* v_smem = s.smem_v.data() + stg * kBlockN * kHeadDim;
+            // Partition SFP (identity) — reuse SFQ's layout (same dimensions)
+            Tensor sSFP = make_tensor(make_smem_ptr(
+                reinterpret_cast<ElementSF*>(s.smem_sfp.data())), SmemLayoutAtomSFP{});
+            Tensor tCrSFP = sm120_partition_fragment_SFA(sSFP, thread_mma);
+            auto sfp_copy = make_tiled_copy_impl(SmemCopyAtomSF{},
+                sm120_get_layoutSFA_TV(tiled_mma),
+                make_shape(size<0>(tile_shape_mnk), size<2>(tile_shape_mnk)));
+            auto sfp_thr = sfp_copy.get_thread_slice(tid);
+            Tensor tCsSFP = sfp_thr.partition_S(sSFP);
+            Tensor tCrSFP_v = sfp_thr.retile_D(tCrSFP);
 
-                Tensor tOrO_rc = make_tensor(tOrO.data(),
-                    flash::convert_layout_acc_rowcol(tOrO.layout()));
+            // Step 5: Partition V^T from SMEM as GEMM-II B-operand
+            Tensor sVt = make_tensor(make_smem_ptr(s.smem_vt.data()), SmemLayoutVtSingleStage{});
+            Tensor tCrVt = thread_mma.partition_fragment_B(sVt);
+            auto copy_Vt_B = make_tiled_copy_B(SmemCopyAtomB{}, tiled_mma);
+            auto thr_copy_Vt = copy_Vt_B.get_thread_slice(tid);
+            Tensor tCsVt = thr_copy_Vt.partition_S(sVt);
+            Tensor tCrVt_v = thr_copy_Vt.retile_D(tCrVt);
 
-                #pragma unroll
-                for (int mi = 0; mi < size<0>(tOrO_rc); ++mi) {
-                    int const row = warp_m * 16 + (mi / 2) * 16 + lane_row + (mi % 2) * 8;
-                    #pragma unroll
-                    for (int ni = 0; ni < size<1>(tOrO_rc); ++ni) {
-                        int const col = (ni / 2) * 8 + lane_col * 2 + (ni % 2);
-                        if (row < kBlockM && col < kHeadDim) {
-                            float sum = 0.0f;
-                            for (int kk = 0; kk < kBlockN; ++kk) {
-                                cutlass::float_e4m3_t p_fp8, v_fp8;
-                                reinterpret_cast<uint8_t&>(p_fp8) = p_smem[row * kBlockN + kk];
-                                reinterpret_cast<uint8_t&>(v_fp8) = v_smem[kk * kHeadDim + col];
-                                sum += static_cast<float>(p_fp8) * static_cast<float>(v_fp8);
-                            }
-                            tOrO_rc(mi, ni) += sum;
-                        }
-                    }
-                }
+            // Partition SFVt (identity) — reuse SFK's layout (same dimensions)
+            Tensor sSFVt = make_tensor(make_smem_ptr(
+                reinterpret_cast<ElementSF*>(s.smem_sfvt.data())), SmemLayoutAtomSFVt{});
+            Tensor tCrSFVt = sm120_partition_fragment_SFB(sSFVt, thread_mma);
+            auto sfvt_copy = make_tiled_copy_impl(SmemCopyAtomSF{},
+                sm120_get_layoutSFB_TV(tiled_mma),
+                make_shape(size<1>(tile_shape_mnk), size<2>(tile_shape_mnk)));
+            auto sfvt_thr = sfvt_copy.get_thread_slice(tid);
+            Tensor tCsSFVt = sfvt_thr.partition_S(sSFVt);
+            Tensor tCrSFVt_v = sfvt_thr.retile_D(tCrSFVt);
+
+            // Step 6: Execute GEMM-II with block-scaled MMA
+            auto K_MAX_PV = size<2>(tCrP);
+            #pragma unroll
+            for (int k = 0; k < K_MAX_PV; ++k) {
+                copy(copy_P_A, tCsP(_, _, k), tCrP_v(_, _, k));
+                copy(copy_Vt_B, tCsVt(_, _, k), tCrVt_v(_, _, k));
+                copy(sfp_copy, tCsSFP(_, _, k), tCrSFP_v(_, _, k));
+                copy(sfvt_copy, tCsSFVt(_, _, k), tCrSFVt_v(_, _, k));
+
+                cute::gemm(tiled_mma,
+                    make_zip_tensor(tCrP(_, _, k), tCrSFP(_, _, k)),
+                    make_zip_tensor(tCrVt(_, _, k), tCrSFVt(_, _, k)),
+                    tOrO);
             }
 
             __syncthreads();
