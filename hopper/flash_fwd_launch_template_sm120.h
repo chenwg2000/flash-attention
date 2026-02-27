@@ -63,7 +63,8 @@ void run_flash_fwd_sm120(Flash_fwd_params &params, cudaStream_t stream) {
         params.scale_softmax,
         params.softcap,
         params.window_size_left, params.window_size_right,
-        seqlen_q, seqlen_k
+        seqlen_q, seqlen_k,
+        num_heads_kv, batch_size
     };
 
     // Build kernel arguments

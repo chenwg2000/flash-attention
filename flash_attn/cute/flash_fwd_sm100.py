@@ -108,7 +108,7 @@ class FlashAttentionForwardSm100:
         self.q_stage = q_stage
         assert self.q_stage in [1, 2]
         self.arch = BaseDSL._get_dsl().get_arch_enum()
-        assert self.arch >= Arch.sm_100 and self.arch <= Arch.sm_110f, "Only SM 10.x and 11.x are supported"
+        assert self.arch >= Arch.sm_100 and self.arch <= Arch.sm_121f, "Only SM 10.x, 11.x, and 12.x are supported"
 
         # 2 Q tile per CTA
         self.cta_tiler = (self.q_stage * m_block_size, n_block_size, self.head_dim_padded)

@@ -250,7 +250,7 @@ def _flash_attn_fwd(
     dtype = torch2cute_dtype_map[q.dtype]
     arch = _get_device_arch() if _arch is None else _arch
 
-    assert arch // 10 in [9, 10, 11], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x"
+    assert arch // 10 in [9, 10, 11, 12], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x, 12.x"
 
     use_block_sparsity = block_sparse_tensors is not None
 
@@ -437,9 +437,10 @@ def _flash_attn_fwd(
         if aux_tensors is not None:
             cute_aux_tensors = [to_cute_aux_tensor(buf) for buf in aux_tensors]
 
-        if arch // 10 == 9:
-            assert page_table is None, "paged KV not supported on SM 9.0"
-            assert not is_split_kv, "SplitKV not supported on SM 9.0"
+        if arch // 10 in [9, 12]:
+            # SM 9.x (Hopper) and SM 12.x (Blackwell consumer, no TMEM) use the Sm90 kernel
+            assert page_table is None, "paged KV not supported on SM 9.0/12.0"
+            assert not is_split_kv, "SplitKV not supported on SM 9.0/12.0"
             # fa_fwd = FlashAttentionForwardSm80(
             fa_fwd = FlashAttentionForwardSm90(
                 dtype,
@@ -589,9 +590,10 @@ def _flash_attn_bwd(
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     arch = _get_device_arch()
-    assert arch // 10 in [9, 10, 11], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x"
+    assert arch // 10 in [9, 10, 11, 12], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x, 12.x"
 
-    if arch // 10 == 9:
+    if arch // 10 in [9, 12]:
+        # SM 9.x (Hopper) and SM 12.x (Blackwell consumer, no TMEM)
         m_block_size = 80 if not causal else 64
         n_block_size = 128
         num_stages_Q = 2
@@ -604,7 +606,7 @@ def _flash_attn_bwd(
         AtomLayoutNdKV = 2
         AtomLayoutMdQ = 1
         cluster_size = 1
-        assert window_size_left is None and window_size_right is None, "local not supported yet on 9.x"
+        assert window_size_left is None and window_size_right is None, "local not supported yet on 9.x/12.x"
         is_varlen = (
             cu_seqlens_q is not None
             or cu_seqlens_k is not None
@@ -659,7 +661,7 @@ def _flash_attn_bwd(
 
     # SM90 block-sparse backward: tile_m=64 is the GCD between a m_block_size that fits,
     # the base block_m of 128 from forward, and block-sparse size for subtiling.
-    if arch // 10 == 9 and use_block_sparsity:
+    if arch // 10 in [9, 12] and use_block_sparsity:
         m_block_size = 64
         # dQ_swapAB tuning: use False when m_block_size=64 (same as causal case)
         dQ_swapAB = False
@@ -911,7 +913,7 @@ def _flash_attn_bwd(
             subtile_factor=subtile_factor,
         )
 
-    if arch // 10 == 9:
+    if arch // 10 in [9, 12]:
         compile_key = (
             arch,
             dtype,
@@ -1012,7 +1014,8 @@ def _flash_attn_bwd(
             AtomLayoutMdQ,
             V_in_regs=V_in_regs,
         )
-        if arch // 10 == 9:
+        if arch // 10 in [9, 12]:
+            # SM 9.x (Hopper) and SM 12.x (Blackwell consumer, no TMEM) use the Sm90 backward
             fa_bwd_obj = FlashAttentionBackwardSm90(
                 dtype,
                 head_dim,
@@ -1116,7 +1119,7 @@ def _flash_attn_bwd(
         normalized_block_sparse_tensors[:4] if normalized_block_sparse_tensors is not None else None,
     )
 
-    num_threads = 256 if arch // 10 == 9 else 128
+    num_threads = 256 if arch // 10 in [9, 12] else 128
     # Postprocess kernel: convert dq_accum from float32 to dq in bf16/fp16
     compile_key_post = (
         arch,

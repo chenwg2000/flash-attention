@@ -37,8 +37,12 @@ public:
     static constexpr uint32_t MinBlocksPerMultiprocessor = 1;
 
     using TensorStorage = typename CollectiveMainloop::TensorStorage;
+    using MainloopPipeline = typename CollectiveMainloop::MainloopPipeline;
+    using PipelineState = typename CollectiveMainloop::PipelineState;
+
     struct SharedStorage : cute::aligned_struct<128> {
         TensorStorage mainloop;
+        typename MainloopPipeline::SharedStorage pipeline;
     };
     static constexpr int SharedStorageSize = sizeof(SharedStorage);
 
@@ -101,6 +105,23 @@ public:
         int const m_start = m_block * kBlockM;
         if (m_start >= params.seqlen_q) return;
 
+        // ====== Initialize pipeline ======
+        typename MainloopPipeline::Params pipeline_params;
+        pipeline_params.transaction_bytes = CollectiveMainloop::TmaTransactionBytesKV;
+        pipeline_params.role = MainloopPipeline::ThreadCategory::ProducerConsumer;
+        pipeline_params.is_leader = (threadIdx.x == 0);
+        pipeline_params.num_consumers = NumMmaThreads;
+
+        MainloopPipeline pipeline(
+            shared_storage.pipeline, pipeline_params, Shape<_1, _1, _1>{});
+
+        PipelineState smem_pipe_write = cutlass::make_producer_start_state<MainloopPipeline>();
+        PipelineState smem_pipe_read;
+
+        // Ensure pipeline barriers are visible to all threads
+        __syncthreads();
+
+        // ====== Mainloop ======
         CollectiveMainloop mainloop;
         TiledMma tiled_mma;
 
@@ -115,53 +136,20 @@ public:
         #pragma unroll
         for (int i = 0; i < kAccRows; ++i) softmax_lse[i] = -INFINITY;
 
-        // ====== Mainloop ======
         mainloop.mha_fwd(
-            params.mainloop, shared_storage.mainloop, tOrO, softmax_lse,
+            params.mainloop, shared_storage.mainloop,
+            pipeline, smem_pipe_read, smem_pipe_write,
+            tOrO, softmax_lse,
             m_block, bidb, bidh, bidh_kv, threadIdx.x);
 
         // ====== Epilogue: write O and LSE ======
-        //
-        // The MMA accumulator has a fragmented register layout.
-        // For the SM120 16x8 atom with 4x2 warp layout:
-        //   - Each atom: 16 rows x 8 cols, DRegisters = float[4]
-        //   - 4 warps along M x 2 warps along N = covers 64x16 per MMA step
-        //   - PermTile 128x16: MMA_M=2 steps along M, MMA_N depends on output dim
-        //
-        // Register layout per atom (C-operand, float[4]):
-        //   lane_idx = threadIdx.x % 32
-        //   Within 16x8 atom output:
-        //     reg[0]: row = (lane/4),     col = (lane%4)*2
-        //     reg[1]: row = (lane/4),     col = (lane%4)*2 + 1
-        //     reg[2]: row = (lane/4) + 8, col = (lane%4)*2
-        //     reg[3]: row = (lane/4) + 8, col = (lane%4)*2 + 1
-        //
-        // With 4x2 atom layout and PermTile (128,16):
-        //   warp_m = warp_idx / 2  (0..3)
-        //   warp_n = warp_idx % 2  (0..1)
-        //   MMA_M = 2 (128 / (4*16) = 2)
-        //   MMA_N = kHeadDim/16 (128/16 = 8 for headdim=128)
-        //
-        // With 8x1 atom layout:
-        //   warp_m = warp_idx (0..7), warp_n = 0 (always)
-        //   atom: 16 rows × 8 cols
-        //   8 warps × 16 = 128 M-rows (MMA_M=1)
-        //   MMA_N = kHeadDim/8 = 16
-        //
-        // Acc shape: ((2,2), MMA_M=1, MMA_N=16) → nrow=2, ncol=32
-        //   row_i: row_i%2 selects atom_row (0→lane/4, 1→lane/4+8)
-        //          row_i/2 selects mma_m (always 0)
-        //   col_j: col_j%2 selects atom_col (0→(lane%4)*2, 1→(lane%4)*2+1)
-        //          col_j/2 selects mma_n (0..15, offset *8)
-
         int const warp_idx = threadIdx.x / 32;
         int const lane_idx = threadIdx.x % 32;
-        int const warp_m = warp_idx;    // 0..7 (all warps along M)
-        int const warp_n = 0;           // always 0
-        int const lane_row = lane_idx / 4;  // 0..7
-        int const lane_col = lane_idx % 4;  // 0..3
+        int const warp_m = warp_idx;
+        int const warp_n = 0;
+        int const lane_row = lane_idx / 4;
+        int const lane_col = lane_idx % 4;
 
-        // Reshape to (nrow, ncol) view
         Tensor tOrO_rowcol = make_tensor(tOrO.data(),
             flash::convert_layout_acc_rowcol(tOrO.layout()));
         int const nrow = size<0>(tOrO_rowcol);
@@ -177,25 +165,19 @@ public:
 
         #pragma unroll
         for (int mi = 0; mi < nrow; ++mi) {
-            // Map row index to global M position
-            // With 8x1 layout: warp_m covers 16 rows, no MMA_M repetition
-            int const atom_row_offset = (mi % 2) * 8;  // 0 or 8
-            int const mma_m = mi / 2;                   // always 0 for 8x1
+            int const atom_row_offset = (mi % 2) * 8;
+            int const mma_m = mi / 2;
             int const global_row = m_start + warp_m * 16 + mma_m * 16 + lane_row + atom_row_offset;
             if (global_row >= params.seqlen_q) continue;
 
-            // Write LSE for this row (only one thread per row writes)
-            // lane_col==0 ensures only one thread per quad writes
             if (lane_col == 0) {
                 lse_ptr[global_row] = softmax_lse[mi];
             }
 
             #pragma unroll
             for (int ni = 0; ni < ncol; ++ni) {
-                // Map col index to global D position
-                // With 8x1: warp_n=0, mma_n=0..15, atom N=8
-                int const atom_col_offset = ni % 2;     // 0 or 1
-                int const mma_n = ni / 2;                // 0..15
+                int const atom_col_offset = ni % 2;
+                int const mma_n = ni / 2;
                 int const global_col = mma_n * 8 + lane_col * 2 + atom_col_offset;
 
                 if (global_col < params.head_dim) {
