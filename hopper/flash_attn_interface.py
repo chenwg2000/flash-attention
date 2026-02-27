@@ -1152,13 +1152,13 @@ def flash_attn_mxfp8_func(
     v_scale,
     softmax_scale=None,
     causal=False,
-    window_size=(-1, -1),
     softcap=0.0,
 ):
     """MXFP8 (Microscaling FP8) Flash Attention for SM120 (RTX 5090).
 
     Uses hardware block-scaled MMA with per-32-element UE8M0 scale factors.
-    Forward pass only. No backward pass support.
+    Forward pass only (no backward). For training, wrap in autograd.Function
+    with a BF16 backward fallback.
 
     Arguments:
         q: (batch_size, seqlen_q, nheads, headdim), float8_e4m3fn
@@ -1169,11 +1169,20 @@ def flash_attn_mxfp8_func(
         v_scale: (batch_size, nheads_kv, seqlen_k, ceil(headdim/32)), uint8 UE8M0
         softmax_scale: float. Default to 1 / sqrt(headdim).
         causal: bool.
-        window_size: (left, right). Sliding window attention.
         softcap: float.
     Return:
         out: (batch_size, seqlen_q, nheads, headdim), bfloat16.
         softmax_lse: (batch_size, nheads, seqlen_q), float32.
+
+    Example:
+        >>> import torch, math
+        >>> b, s, h, d = 4, 2048, 32, 128
+        >>> q = torch.randn(b, s, h, d, device='cuda').to(torch.float8_e4m3fn)
+        >>> k = torch.randn(b, s, h, d, device='cuda').to(torch.float8_e4m3fn)
+        >>> v = torch.randn(b, s, h, d, device='cuda').to(torch.float8_e4m3fn)
+        >>> # Identity scales (UE8M0: 127 = 2^0 = 1.0)
+        >>> sf = lambda t: torch.full((*t.shape[:3], d//32), 127, dtype=torch.uint8, device='cuda')
+        >>> out, lse = flash_attn_mxfp8_func(q, k, v, sf(q), sf(k), sf(v))
     """
     assert q.dtype == torch.float8_e4m3fn, "q must be float8_e4m3fn"
     assert k.dtype == torch.float8_e4m3fn, "k must be float8_e4m3fn"
@@ -1185,11 +1194,15 @@ def flash_attn_mxfp8_func(
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
 
-    # This function will be connected to the C++ SM120 kernel
-    # via the flash_attn_3 op registration.
-    # For now, return placeholder - the actual binding will be added
-    # once the C++ kernel compiles and runs.
-    batch_size, seqlen_q, nheads, headdim = q.shape
-    out = torch.zeros(batch_size, seqlen_q, nheads, headdim, dtype=torch.bfloat16, device=q.device)
-    softmax_lse = torch.zeros(batch_size, nheads, seqlen_q, dtype=torch.float32, device=q.device)
+    q = q.contiguous()
+    k = k.contiguous()
+    v = v.contiguous()
+    q_scale = q_scale.contiguous()
+    k_scale = k_scale.contiguous()
+    v_scale = v_scale.contiguous()
+
+    out, softmax_lse = flash_attn_3_gpu.fwd_mxfp8(
+        q, k, v, q_scale, k_scale, v_scale,
+        softmax_scale, causal, softcap,
+    )
     return out, softmax_lse

@@ -1774,6 +1774,161 @@ mha_combine(Tensor out_partial,         // num_splits x batch_size x seqlen x nu
     return {out, softmax_lse};
 }
 
+// ====== SM120 MXFP8 dedicated forward op ======
+std::tuple<Tensor, Tensor>
+mha_fwd_mxfp8(
+    Tensor q,           // (b, s_q, h, d), float8_e4m3fn
+    Tensor k,           // (b, s_k, h_k, d), float8_e4m3fn
+    Tensor v,           // (b, s_k, h_k, d), float8_e4m3fn
+    Tensor q_scale,     // (b, h, s_q, d/32), uint8 UE8M0
+    Tensor k_scale,     // (b, h_k, s_k, d/32), uint8 UE8M0
+    Tensor v_scale,     // (b, h_k, s_k, d/32), uint8 UE8M0
+    double softmax_scale,
+    bool is_causal,
+    double softcap
+) {
+    auto dprops = get_device_prop();
+    int arch = dprops->major * 10 + dprops->minor;
+    STD_TORCH_CHECK(arch >= 120, "MXFP8 attention requires SM120 (RTX 5090) or later.");
+
+    STD_TORCH_CHECK(q.scalar_type() == torch::headeronly::ScalarType::Float8_e4m3fn, "q must be float8_e4m3fn");
+    STD_TORCH_CHECK(k.scalar_type() == torch::headeronly::ScalarType::Float8_e4m3fn, "k must be float8_e4m3fn");
+    STD_TORCH_CHECK(v.scalar_type() == torch::headeronly::ScalarType::Float8_e4m3fn, "v must be float8_e4m3fn");
+    STD_TORCH_CHECK(q_scale.scalar_type() == torch::headeronly::ScalarType::Byte, "q_scale must be uint8");
+    STD_TORCH_CHECK(k_scale.scalar_type() == torch::headeronly::ScalarType::Byte, "k_scale must be uint8");
+    STD_TORCH_CHECK(v_scale.scalar_type() == torch::headeronly::ScalarType::Byte, "v_scale must be uint8");
+
+    CHECK_DEVICE(q); CHECK_DEVICE(k); CHECK_DEVICE(v);
+    CHECK_DEVICE(q_scale); CHECK_DEVICE(k_scale); CHECK_DEVICE(v_scale);
+
+    STD_TORCH_CHECK(q.stride(-1) == 1, "q must have contiguous last dimension");
+    STD_TORCH_CHECK(k.stride(-1) == 1, "k must have contiguous last dimension");
+    STD_TORCH_CHECK(v.stride(-1) == 1, "v must have contiguous last dimension");
+
+    int const batch_size = q.size(0);
+    int const seqlen_q = q.size(1);
+    int const num_heads = q.size(2);
+    int const headdim = q.size(3);
+    int const seqlen_k = k.size(1);
+    int const num_heads_k = k.size(2);
+
+    STD_TORCH_CHECK(num_heads % num_heads_k == 0, "num_heads must be divisible by num_heads_k");
+    STD_TORCH_CHECK(k.size(3) == headdim, "k headdim must match q");
+    STD_TORCH_CHECK(v.size(3) == headdim, "v headdim must match q");
+
+    int const sf_cols = (headdim + 31) / 32;
+    CHECK_SHAPE(q_scale, batch_size, num_heads, seqlen_q, sf_cols);
+    CHECK_SHAPE(k_scale, batch_size, num_heads_k, seqlen_k, sf_cols);
+    CHECK_SHAPE(v_scale, batch_size, num_heads_k, seqlen_k, sf_cols);
+
+    // Allocate output and LSE
+    auto out = torch::stable::new_empty(q, {batch_size, seqlen_q, num_heads, headdim},
+        std::make_optional(torch::headeronly::ScalarType::BFloat16));
+    auto softmax_lse = torch::stable::new_empty(q, {batch_size, num_heads, seqlen_q},
+        std::make_optional(torch::headeronly::ScalarType::Float));
+
+    auto device_guard = make_device_guard(q);
+
+    // Populate params
+    Flash_fwd_params params{};
+    params.is_bf16 = false;
+    params.is_e4m3 = true;
+
+    params.q_ptr = q.data_ptr();
+    params.k_ptr = k.data_ptr();
+    params.v_ptr = v.data_ptr();
+    params.o_ptr = out.data_ptr();
+    params.softmax_lse_ptr = softmax_lse.data_ptr();
+
+    params.q_batch_stride = q.stride(0);
+    params.q_row_stride = q.stride(1);
+    params.q_head_stride = q.stride(2);
+    params.k_batch_stride = k.stride(0);
+    params.k_row_stride = k.stride(1);
+    params.k_head_stride = k.stride(2);
+    params.v_batch_stride = v.stride(0);
+    params.v_row_stride = v.stride(1);
+    params.v_head_stride = v.stride(2);
+    params.v_dim_stride = v.stride(3);
+    params.o_batch_stride = out.stride(0);
+    params.o_row_stride = out.stride(1);
+    params.o_head_stride = out.stride(2);
+
+    // MXFP8 scale factors
+    params.q_scale_ptr = q_scale.data_ptr();
+    params.q_scale_batch_stride = q_scale.stride(0);
+    params.q_scale_head_stride = q_scale.stride(1);
+    params.q_scale_row_stride = q_scale.stride(2);
+    params.k_scale_ptr = k_scale.data_ptr();
+    params.k_scale_batch_stride = k_scale.stride(0);
+    params.k_scale_head_stride = k_scale.stride(1);
+    params.k_scale_row_stride = k_scale.stride(2);
+    params.v_scale_ptr = v_scale.data_ptr();
+    params.v_scale_batch_stride = v_scale.stride(0);
+    params.v_scale_head_stride = v_scale.stride(1);
+    params.v_scale_row_stride = v_scale.stride(2);
+
+    params.b = batch_size;
+    params.seqlen_q = seqlen_q;
+    params.seqlen_k = seqlen_k;
+    params.h = num_heads;
+    params.h_k = num_heads_k;
+    params.d = headdim;
+    params.dv = headdim;
+    params.d_rounded = headdim;
+    params.dv_rounded = headdim;
+    params.total_q = batch_size * seqlen_q;
+    params.total_k = batch_size * seqlen_k;
+
+    params.scale_softmax = static_cast<float>(softmax_scale);
+    params.softcap = static_cast<float>(softcap);
+    params.arch = arch;
+    params.num_sm = dprops->multiProcessorCount;
+    params.num_splits = 1;
+
+    if (is_causal) {
+        params.is_causal = true;
+        params.window_size_left = seqlen_k - 1;
+        params.window_size_right = 0;
+    } else {
+        params.is_causal = false;
+        params.window_size_left = seqlen_k - 1;
+        params.window_size_right = seqlen_q - 1;
+    }
+
+    if (batch_size > 0 && seqlen_q > 0 && seqlen_k > 0 && num_heads_k > 0) {
+        auto device_idx = torch::stable::accelerator::getCurrentDeviceIndex();
+        void* stream_ptr = nullptr;
+        TORCH_ERROR_CODE_CHECK(aoti_torch_get_current_cuda_stream(device_idx, &stream_ptr));
+        cudaStream_t stream = static_cast<cudaStream_t>(stream_ptr);
+        run_mha_fwd(params, stream);
+    }
+
+    return {out, softmax_lse};
+}
+
+void boxed_mha_fwd_mxfp8(
+    StableIValue* stack,
+    uint64_t num_args,
+    uint64_t num_outputs
+) {
+    auto q = to<Tensor>(stack[0]);
+    auto k = to<Tensor>(stack[1]);
+    auto v = to<Tensor>(stack[2]);
+    auto q_scale = to<Tensor>(stack[3]);
+    auto k_scale = to<Tensor>(stack[4]);
+    auto v_scale = to<Tensor>(stack[5]);
+    auto softmax_scale = to<double>(stack[6]);
+    auto is_causal = to<bool>(stack[7]);
+    auto softcap = to<double>(stack[8]);
+
+    auto [out, softmax_lse] = mha_fwd_mxfp8(q, k, v, q_scale, k_scale, v_scale,
+        softmax_scale, is_causal, softcap);
+
+    stack[0] = from(out);
+    stack[1] = from(softmax_lse);
+}
+
 void boxed_mha_fwd(
     StableIValue* stack,
     uint64_t num_args,
@@ -1975,6 +2130,16 @@ STABLE_TORCH_LIBRARY(flash_attn_3, m) {
         "Tensor lse_partial,"
         "Tensor(out!)? out = None,"
         "ScalarType? out_dtype = None) -> (Tensor(out!), Tensor)");
+    m.def("fwd_mxfp8("
+        "Tensor q,"
+        "Tensor k,"
+        "Tensor v,"
+        "Tensor q_scale,"
+        "Tensor k_scale,"
+        "Tensor v_scale,"
+        "float softmax_scale,"
+        "bool is_causal = False,"
+        "float softcap = 0.0) -> (Tensor, Tensor)");
     m.def("get_scheduler_metadata("
         "int batch_size,"
         "int max_seqlen_q,"
@@ -2005,6 +2170,7 @@ STABLE_TORCH_LIBRARY(flash_attn_3, m) {
 STABLE_TORCH_LIBRARY_IMPL(flash_attn_3, CUDA, m) {
     m.impl("fwd", &boxed_mha_fwd);
     m.impl("bwd", &boxed_mha_bwd);
+    m.impl("fwd_mxfp8", &boxed_mha_fwd_mxfp8);
     m.impl("fwd_combine", &boxed_mha_combine);
     m.impl("get_scheduler_metadata", &boxed_mha_fwd_get_scheduler_metadata);
 }
