@@ -4,21 +4,21 @@
  * Each CTA owns one N-block (K/V block). Grid: (n_blocks, heads_kv, batch).
  * dK and dV accumulate in FP32 registers across all M-blocks, then write as BF16.
  *
- * Hybrid FP8/BF16 design:
- *   GEMM-1 (S = Q @ K^T): FP8 block-scaled MMA (must match forward for exact P)
- *   GEMM-2 (dP = dO @ V):  FP8 block-scaled MMA (dO BF16->FP8, V resident, identity SFs)
- *   GEMM-3 (dV += P^T @ dO^T): SM80-style BF16 MMA
- *   GEMM-4 (dK += dS^T @ Q^T): SM80-style BF16 MMA
+ * All-FP8 block-scaled design:
+ *   GEMM-1 (S = Q @ K^T):      FP8 block-scaled MMA (real SFs from GMEM)
+ *   GEMM-2 (dP = dO @ V):      FP8 block-scaled MMA (identity SFs)
+ *   GEMM-3 (dV += P^T @ dO^T): FP8 block-scaled MMA (identity SFs, K padded 64→128)
+ *   GEMM-4 (dK += dS^T @ Q^T): FP8 block-scaled MMA (identity SFs, K padded 64→128)
  *
  * SMEM budget (~98 KB, fits in 101 KB):
  *   K [128x128 FP8 SW128]:  16 KB (resident)
  *   V [128x128 FP8 SW128]:  16 KB (resident, swizzled directly)
- *   SFK [512B]:               <1 KB (resident, then repurposed for V identity SFs)
- *   Q [128x128 FP8 SW128]:  16 KB (per M-block, padded; also reused for dO_fp8, P^T, dS^T)
- *   SFQ [512B]:               <1 KB (per M-block; also reused for dO identity SFs)
+ *   SFK [512B]:               <1 KB (resident, then repurposed for identity SFs)
+ *   Q [128x128 FP8 SW128]:  16 KB (per M-block, padded; reused for P^T, dO_fp8, dS^T)
+ *   SFQ [512B]:               <1 KB (per M-block; reused for identity SFs)
  *   dO [64x128 BF16 SW128]: 16 KB (per M-block)
- *   P/dS [64x128 BF16 SW128]: 16 KB (scratch)
- *   Q^T/P^T [128x64 BF16 SW128]: 16 KB (scratch)
+ *   P/dS [64x128 BF16 SW128]: 16 KB (scratch; reused for dO^T FP8 [128x128])
+ *   Q^T [128x128 FP8 SW128]: 16 KB (scratch)
  ******************************************************************************/
 
 #pragma once
@@ -81,18 +81,10 @@ struct CollectiveMainloopBwdSm120 {
         MMA_Atom<MmaAtomOp>{}, AtomLayoutMNK_G1{},
         Tile<PermTileM_G1, _8, _32>{}));
 
-    // SM80 BF16 MMA for GEMMs 3-4
-    using MmaAtomOp_BF16 = SM80_16x8x16_F32BF16BF16F32_TN;
-
-    // GEMM-3: dV[128xD] += P^T[128x64] @ dO^T[Dx64] — 8x1x1
-    using TiledMma_G3 = decltype(cute::make_tiled_mma(
-        MMA_Atom<MmaAtomOp_BF16>{}, Layout<Shape<_8, _1, _1>>{},
-        Tile<_128, _16, _16>{}));
-
-    // GEMM-4: dK[128xD] += dS^T[128x64] @ Q^T[Dx64] — 8x1x1
-    using TiledMma_G4 = decltype(cute::make_tiled_mma(
-        MMA_Atom<MmaAtomOp_BF16>{}, Layout<Shape<_8, _1, _1>>{},
-        Tile<_128, _16, _16>{}));
+    // GEMMs 3-4 reuse FP8 block-scaled MMA (K padded 64→128, identity SFs)
+    // Accumulator layout matches G1: both produce identical (mi,ni)→(row,col) mapping
+    using TiledMma_G3 = TiledMma_G1;  // dV += P^T_fp8 @ dO^T_fp8
+    using TiledMma_G4 = TiledMma_G1;  // dK += dS^T_fp8 @ Q^T_fp8
 
     static constexpr int NumMmaThreads = 256;
 
@@ -111,11 +103,6 @@ struct CollectiveMainloopBwdSm120 {
     using SmemLayoutQ = decltype(tile_to_shape(SmemLayoutAtomSW_FP8{}, Shape<Int<kBlockM_SF>, Int<kHeadDim>>{}));
     using SmemLayoutdO = decltype(tile_to_shape(SmemLayoutAtomSW_BF16{}, Shape<Int<kBlockM>, Int<kHeadDim>>{}));
     using SmemLayoutPdS = decltype(tile_to_shape(SmemLayoutAtomSW_BF16{}, Shape<Int<kBlockM>, Int<kBlockN>>{}));
-    using SmemLayoutPt = decltype(tile_to_shape(SmemLayoutAtomSW_BF16{}, Shape<Int<kBlockN>, Int<kBlockM>>{}));
-    // Transposed dO and Q layouts for GEMM-3/4 B-operands
-    // dO^T [kHeadDim x kBlockM BF16] and Q^T [kHeadDim x kBlockM BF16]
-    using SmemLayoutdOt = decltype(tile_to_shape(SmemLayoutAtomSW_BF16{}, Shape<Int<kHeadDim>, Int<kBlockM>>{}));
-    using SmemLayoutQt = SmemLayoutdOt;  // Same shape: [128 x 64 BF16]
 
     // ====== SF layouts ======
     // SFQ uses padded kBlockM_SF=128 to satisfy Blk_MN=128 constraint.
@@ -146,8 +133,6 @@ struct CollectiveMainloopBwdSm120 {
     using SmemCopyAtomA_G1 = Copy_Atom<SM75_U32x4_LDSM_N, uint8_t>;
     using SmemCopyAtomB_G1 = Copy_Atom<SM75_U32x2_LDSM_N, uint8_t>;
     using SmemCopyAtomSF = Copy_Atom<UniversalCopy<uint8_t>, uint8_t>;
-    using SmemCopyAtomA_BF16 = Copy_Atom<SM75_U32x4_LDSM_N, cutlass::bfloat16_t>;
-    using SmemCopyAtomB_BF16 = Copy_Atom<SM75_U32x2_LDSM_N, cutlass::bfloat16_t>;
 
     // Forward mainloop type for static helpers
     using FwdMainloop = CollectiveMainloopFwdSm120<1,
@@ -173,7 +158,7 @@ struct CollectiveMainloopBwdSm120 {
         };
         alignas(1024) cute::array_aligned<uint8_t, cute::cosize_v<SmemLayoutdO> * 2> smem_do;       // 16 KB (BF16)
         alignas(1024) cute::array_aligned<uint8_t, cute::cosize_v<SmemLayoutPdS> * 2> smem_pds;     // 16 KB (BF16)
-        alignas(1024) cute::array_aligned<uint8_t, cute::cosize_v<SmemLayoutPt> * 2> smem_pt;       // 16 KB (BF16)
+        alignas(1024) cute::array_aligned<uint8_t, cute::cosize_v<SmemLayoutK>> smem_pt;              // 16 KB (FP8 [128x128])
     };
     static constexpr int SharedStorageSize = sizeof(TensorStorage);
 
@@ -233,57 +218,55 @@ struct CollectiveMainloopBwdSm120 {
                 a.num_heads / a.num_heads_kv};
     }
 
-    // ====== BF16 transpose: [rows x cols] -> [cols x rows] (both SW128 swizzled) ======
-    CUTLASS_DEVICE static void transpose_bf16_smem(
-        uint8_t const* __restrict__ src, uint8_t* __restrict__ dst,
+    // ====== BF16 -> FP8 transpose + pad: [rows x cols] BF16 SW128 -> [cols x 128] FP8 SW128 ======
+    // Transposes and converts BF16 to FP8, zero-padding the K dimension from rows to 128.
+    // Used for P, dO, dS transposes (rows=kBlockM=64, cols=kBlockN/kHeadDim=128).
+    CUTLASS_DEVICE static void transpose_bf16_to_fp8_padded(
+        uint8_t const* __restrict__ src_bf16,
+        uint8_t* __restrict__ dst_fp8,
         int rows, int cols, int tid, int nthreads)
     {
-        int blocks_r = rows / 2;
-        int blocks_c = cols / 2;
-        int total = blocks_r * blocks_c;
-        for (int blk = tid; blk < total; blk += nthreads) {
-            int br = blk / blocks_c, bc = blk % blocks_c;
-            int r = br * 2, c = bc * 2;
-            uint16_t vals[2][2];
-            #pragma unroll
-            for (int i = 0; i < 2; ++i) {
-                int sb = ((r + i) * cols + c) * 2;
-                int sw = sb ^ (((sb >> 7) & 7) << 4);
-                uint32_t pair = *reinterpret_cast<uint32_t const*>(src + sw);
-                vals[i][0] = pair & 0xFFFF;
-                vals[i][1] = pair >> 16;
+        static constexpr int kPadK = 128;
+        int const out_rows = cols;
+        int const total = out_rows * kPadK;
+        for (int i = tid; i < total; i += nthreads) {
+            int const dr = i / kPadK;
+            int const dc = i % kPadK;
+            uint8_t fp8_byte;
+            if (dc < rows) {
+                // Read src[dc][dr] BF16 swizzled (transposed access)
+                int src_off = (dc * cols + dr) * 2;
+                int src_sw = src_off ^ (((src_off >> 7) & 7) << 4);
+                cutlass::bfloat16_t bf16_val = *reinterpret_cast<cutlass::bfloat16_t const*>(src_bf16 + src_sw);
+                cutlass::float_e4m3_t fp8_val = static_cast<cutlass::float_e4m3_t>(static_cast<float>(bf16_val));
+                fp8_byte = reinterpret_cast<uint8_t const&>(fp8_val);
+            } else {
+                fp8_byte = 0;
             }
-            #pragma unroll
-            for (int i = 0; i < 2; ++i) {
-                int db = ((c + i) * rows + r) * 2;
-                int dw = db ^ (((db >> 7) & 7) << 4);
-                *reinterpret_cast<uint32_t*>(dst + dw) =
-                    uint32_t(vals[0][i]) | (uint32_t(vals[1][i]) << 16);
-            }
+            int dst_off = dr * kPadK + dc;
+            int dst_sw = dst_off ^ (((dst_off >> 7) & 7) << 4);
+            dst_fp8[dst_sw] = fp8_byte;
         }
     }
 
-    // ====== FP8 -> BF16 convert + transpose: [rows x cols] FP8 SW128 -> [cols x rows] BF16 SW128 ======
-    CUTLASS_DEVICE static void convert_fp8_to_bf16_transpose(
+    // ====== FP8 transpose: [128 x 128] FP8 SW128 -> [128 x 128] FP8 SW128 ======
+    // Used for Q (FP8 padded [128x128]) -> Q^T (FP8 [128x128], cols 64-127 = 0).
+    CUTLASS_DEVICE static void transpose_fp8_swizzled(
         uint8_t const* __restrict__ src_fp8,
-        uint8_t* __restrict__ dst_bf16,
-        int rows, int cols, int tid, int nthreads)
+        uint8_t* __restrict__ dst_fp8,
+        int tid, int nthreads)
     {
-        int total = rows * cols;
+        static constexpr int N = 128;
+        static constexpr int total = N * N;
         for (int i = tid; i < total; i += nthreads) {
-            int r = i / cols;
-            int c = i % cols;
-            // Read FP8 from swizzled source
-            int src_off = r * cols + c;
+            int const r = i / N;
+            int const c = i % N;
+            int src_off = r * N + c;
             int src_sw = src_off ^ (((src_off >> 7) & 7) << 4);
-            uint8_t fp8_byte = src_fp8[src_sw];
-            cutlass::bfloat16_t bf16_val = static_cast<cutlass::bfloat16_t>(
-                static_cast<float>(cutlass::float_e4m3_t::bitcast(fp8_byte)));
-            // Write BF16 to transposed position in swizzled destination
-            int dst_off = (c * rows + r) * 2;
+            uint8_t val = src_fp8[src_sw];
+            int dst_off = c * N + r;
             int dst_sw = dst_off ^ (((dst_off >> 7) & 7) << 4);
-            *reinterpret_cast<uint16_t*>(dst_bf16 + dst_sw) =
-                reinterpret_cast<uint16_t const&>(bf16_val);
+            dst_fp8[dst_sw] = val;
         }
     }
 
@@ -369,8 +352,7 @@ struct CollectiveMainloopBwdSm120 {
         auto sfk_thr = sfk_copy.get_thread_slice(tid);
         Tensor tCsSFK = sfk_thr.partition_S(sSFK);
         Tensor tCrSFK_v = sfk_thr.retile_D(tCrSFK);
-        for (int k = 0; k < size<2>(tCrSFK_v); ++k) copy(sfk_copy, tCsSFK(_,_,k), tCrSFK_v(_,_,k));
-        for (int k = 0; k < size<2>(tCrK_v); ++k) copy(copy_B_g1, tCsK(_,_,k), tCrK_v(_,_,k));
+        // K and SFK loaded per M-block in Phase B (not pre-loaded) to reduce register pressure
 
         // ====== Set up GEMM-2 V partition (resident) ======
         // V[kBlockN, kHeadDim] in smem_vt — same layout as K in smem_k (since kBlockN==kHeadDim)
@@ -400,6 +382,44 @@ struct CollectiveMainloopBwdSm120 {
         Tensor tCsSFV = sfv_thr.partition_S(sSFV);
         Tensor tCrSFV_v = sfv_thr.retile_D(tCrSFV);
         for (int k = 0; k < size<2>(tCrSFV_v); ++k) copy(sfv_copy, tCsSFV(_,_,k), tCrSFV_v(_,_,k));
+
+        // ====== Set up shared A-partition from smem_q (reused by GEMM-1/2/3/4) ======
+        Tensor sQ = make_tensor(make_smem_ptr(s.smem_q.data()), SmemLayoutQ{});
+        Tensor sQ_pi = cute::as_position_independent_swizzle_tensor(sQ);
+        auto sQ_flat = make_tensor(make_smem_ptr(s.smem_q.data()),
+            make_layout(make_shape(Int<kBlockM_SF>{}, Int<kHeadDim>{})));
+        Tensor tCrQ = thread_mma_g1.partition_fragment_A(sQ_flat);
+        auto copy_A_g1 = make_tiled_copy_A(SmemCopyAtomA_G1{}, tiled_mma_g1);
+        auto thr_copy_A_g1 = copy_A_g1.get_thread_slice(tid);
+        Tensor tCsQ = thr_copy_A_g1.partition_S(sQ_pi);
+        Tensor tCrQ_v = thr_copy_A_g1.retile_D(tCrQ);
+
+        // ====== Set up SFQ partition from smem_sfq (reused by GEMM-1/2/3/4) ======
+        Tensor sSFQ = make_tensor(make_smem_ptr(reinterpret_cast<ElementSF*>(s.smem_sfq.data())),
+            SmemLayoutAtomSFQ{});
+        Tensor tCrSFQ = sm120_partition_fragment_SFA(sSFQ, thread_mma_g1);
+        auto sfq_copy = make_tiled_copy_impl(SmemCopyAtomSF{},
+            sm120_get_layoutSFA_TV(tiled_mma_g1),
+            make_shape(size<0>(tile_shape_g1), size<2>(tile_shape_g1)));
+        auto sfq_thr = sfq_copy.get_thread_slice(tid);
+        Tensor tCsSFQ = sfq_thr.partition_S(sSFQ);
+        Tensor tCrSFQ_v = sfq_thr.retile_D(tCrSFQ);
+
+        // ====== Set up shared B-partition for GEMM-3/4 (one fragment, two sources) ======
+        // GEMM-3 B: dO^T FP8 from smem_pds, GEMM-4 B: Q^T FP8 from smem_pt
+        Tensor sPds_fp8 = make_tensor(make_smem_ptr(s.smem_pds.data()), SmemLayoutK{});
+        Tensor sPds_fp8_pi = cute::as_position_independent_swizzle_tensor(sPds_fp8);
+        auto sPds_flat = make_tensor(make_smem_ptr(s.smem_pds.data()),
+            make_layout(make_shape(Int<kBlockN>{}, Int<kHeadDim>{})));
+        Tensor tCrB34 = thread_mma_g1.partition_fragment_B(sPds_flat);
+        auto copy_B_g34 = make_tiled_copy_B(SmemCopyAtomB_G1{}, tiled_mma_g1);
+        auto thr_copy_B_g34 = copy_B_g34.get_thread_slice(tid);
+        Tensor tCsPds = thr_copy_B_g34.partition_S(sPds_fp8_pi);
+        Tensor tCrB34_v = thr_copy_B_g34.retile_D(tCrB34);
+
+        Tensor sPt_fp8 = make_tensor(make_smem_ptr(s.smem_pt.data()), SmemLayoutK{});
+        Tensor sPt_fp8_pi = cute::as_position_independent_swizzle_tensor(sPt_fp8);
+        Tensor tCsPt = thr_copy_B_g34.partition_S(sPt_fp8_pi);
 
         int const warp_idx = tid / 32;
         int const lane_idx = tid % 32;
@@ -444,28 +464,11 @@ struct CollectiveMainloopBwdSm120 {
                 }
                 __syncthreads();  // sync #1: loads visible
 
-                // ====== Phase B: Partition Q + SFQ, then GEMM-1: S = Q @ K^T ======
-                Tensor sQ = make_tensor(make_smem_ptr(s.smem_q.data()), SmemLayoutQ{});
-                Tensor sQ_pi = cute::as_position_independent_swizzle_tensor(sQ);
-                auto sQ_flat = make_tensor(make_smem_ptr(s.smem_q.data()),
-                    make_layout(make_shape(Int<kBlockM_SF>{}, Int<kHeadDim>{})));
-                Tensor tCrQ = thread_mma_g1.partition_fragment_A(sQ_flat);
-                auto copy_A_g1 = make_tiled_copy_A(SmemCopyAtomA_G1{}, tiled_mma_g1);
-                auto thr_copy_A_g1 = copy_A_g1.get_thread_slice(tid);
-                Tensor tCsQ = thr_copy_A_g1.partition_S(sQ_pi);
-                Tensor tCrQ_v = thr_copy_A_g1.retile_D(tCrQ);
+                // ====== Phase B: Copy Q + SFQ + K + SFK to registers, GEMM-1: S = Q @ K^T ======
                 for (int k = 0; k < size<2>(tCrQ_v); ++k) copy(copy_A_g1, tCsQ(_,_,k), tCrQ_v(_,_,k));
-
-                Tensor sSFQ = make_tensor(make_smem_ptr(reinterpret_cast<ElementSF*>(s.smem_sfq.data())),
-                    SmemLayoutAtomSFQ{});
-                Tensor tCrSFQ = sm120_partition_fragment_SFA(sSFQ, thread_mma_g1);
-                auto sfq_copy = make_tiled_copy_impl(SmemCopyAtomSF{},
-                    sm120_get_layoutSFA_TV(tiled_mma_g1),
-                    make_shape(size<0>(tile_shape_g1), size<2>(tile_shape_g1)));
-                auto sfq_thr = sfq_copy.get_thread_slice(tid);
-                Tensor tCsSFQ = sfq_thr.partition_S(sSFQ);
-                Tensor tCrSFQ_v = sfq_thr.retile_D(tCrSFQ);
                 for (int k = 0; k < size<2>(tCrSFQ_v); ++k) copy(sfq_copy, tCsSFQ(_,_,k), tCrSFQ_v(_,_,k));
+                for (int k = 0; k < size<2>(tCrK_v); ++k) copy(copy_B_g1, tCsK(_,_,k), tCrK_v(_,_,k));
+                for (int k = 0; k < size<2>(tCrSFK_v); ++k) copy(sfk_copy, tCsSFK(_,_,k), tCrSFK_v(_,_,k));
 
                 Tensor acc_s = partition_fragment_C(tiled_mma_g1, make_shape(Int<kBlockM>{}, Int<kBlockN>{}));
                 clear(acc_s);
@@ -475,6 +478,11 @@ struct CollectiveMainloopBwdSm120 {
                         make_zip_tensor(tCrK(_,_,k), tCrSFK(_,_,k)),
                         acc_s);
                 }
+
+                // ====== Phase B': Fill smem_sfq with identity SFs (real SFQ already in registers) ======
+                // Identity SFs serve as SFA for GEMMs 2/3/4, SFB from smem_sfk (already identity)
+                FwdMainloop::fill_identity_sf(s.smem_sfq.data(), cute::cosize_v<SmemLayoutAtomSFQ>,
+                    tid, NumMmaThreads);
 
                 // ====== Phase C: Causal mask + padded mask + softmax ======
                 if constexpr (Is_causal) {
@@ -541,15 +549,27 @@ struct CollectiveMainloopBwdSm120 {
                     }
                 }
 
-                // ====== Phase D: Q FP8 -> Q^T BF16 -> smem_pt (before smem_q overwritten) ======
-                convert_fp8_to_bf16_transpose(
+                // ====== Phase D: Q FP8 -> Q^T FP8 -> smem_pt (before smem_q overwritten) ======
+                // Q [128x128 FP8 padded] → Q^T [128x128 FP8] (cols 64-127 = 0 from padding)
+                transpose_fp8_swizzled(
                     s.smem_q.data(), s.smem_pt.data(),
-                    kBlockM, kHeadDim, tid, NumMmaThreads);
+                    tid, NumMmaThreads);
 
-                // ====== Phase E1: P scatter -> smem_pds (parallel with D, independent buffers) ======
+                __syncthreads();  // sync #2: D reads smem_q done + D writes smem_pt done + B' done
+
+                // Reload tCrSFQ with identity values (smem_sfq now has identity from Phase B')
+                for (int k = 0; k < size<2>(tCrSFQ_v); ++k) copy(sfq_copy, tCsSFQ(_,_,k), tCrSFQ_v(_,_,k));
+
+                // ====== Phase E (combined E1+E2): Scatter P → smem_q as FP8 transposed padded ======
+                // P^T FP8 [128×128] with cols 64-127 = 0 (zero-padding from kBlockM=64)
                 {
+                    // Zero-fill smem_q for padding
+                    int total16 = cute::cosize_v<SmemLayoutQ> / 16;
+                    for (int i = tid; i < total16; i += NumMmaThreads)
+                        reinterpret_cast<uint4*>(s.smem_q.data())[i] = make_uint4(0,0,0,0);
+                    // Scatter P from registers to transposed FP8 positions
                     int const wm = warp_idx;
-                    auto* pds = s.smem_pds.data();
+                    auto* dst = s.smem_q.data();
                     #pragma unroll
                     for (int mi = 0; mi < nrow_s; ++mi) {
                         int const row = wm * 16 + (mi / 2) * 16 + lane_row + (mi % 2) * 8;
@@ -557,119 +577,66 @@ struct CollectiveMainloopBwdSm120 {
                         #pragma unroll
                         for (int ni = 0; ni < ncol_s; ni += 2) {
                             int const col = (ni / 2) * 8 + lane_col * 2;
-                            ElementBf16 b0 = static_cast<ElementBf16>(acc_s_rc(mi, ni));
-                            ElementBf16 b1 = static_cast<ElementBf16>(acc_s_rc(mi, ni + 1));
-                            int bo = (row * kBlockN + col) * 2;
-                            int sw = bo ^ (((bo >> 7) & 7) << 4);
-                            *reinterpret_cast<uint32_t*>(pds + sw) =
-                                uint32_t(reinterpret_cast<uint16_t const&>(b0)) |
-                                (uint32_t(reinterpret_cast<uint16_t const&>(b1)) << 16);
+                            #pragma unroll
+                            for (int i = 0; i < 2; ++i) {
+                                cutlass::float_e4m3_t fp8_val = static_cast<cutlass::float_e4m3_t>(acc_s_rc(mi, ni + i));
+                                uint8_t fp8_byte = reinterpret_cast<uint8_t const&>(fp8_val);
+                                // P^T[col+i][row] → byte offset = (col+i) * 128 + row
+                                int dst_off = (col + i) * 128 + row;
+                                int dst_sw = dst_off ^ (((dst_off >> 7) & 7) << 4);
+                                dst[dst_sw] = fp8_byte;
+                            }
                         }
                     }
                 }
-                __syncthreads();  // sync #2: D reads smem_q done, D writes smem_pt done, E1 writes smem_pds done
-
-                // ====== Phase E2: P -> P^T -> smem_q (read smem_pds, write smem_q) ======
-                transpose_bf16_smem(s.smem_pds.data(), s.smem_q.data(),
-                    kBlockM, kBlockN, tid, NumMmaThreads);
-                __syncthreads();  // sync #3: E2 reads smem_pds done, E2 writes smem_q done
-
-                // ====== Phase F: dO -> dO^T -> smem_pds (read smem_do, write smem_pds) ======
-                transpose_bf16_smem(s.smem_do.data(), s.smem_pds.data(),
+                // Phase E writes smem_q, Phase F writes smem_pds — independent, no sync between
+                // ====== Phase F: dO BF16 -> dO^T FP8 padded -> smem_pds ======
+                // dO [64x128 BF16] → dO^T [128x128 FP8] (cols 64-127 = 0)
+                transpose_bf16_to_fp8_padded(s.smem_do.data(), s.smem_pds.data(),
                     kBlockM, kHeadDim, tid, NumMmaThreads);
-                __syncthreads();  // sync #4: F writes smem_pds done, P^T in smem_q stable
+                __syncthreads();  // sync #3: E+F done (smem_q has P^T, smem_pds has dO^T)
 
-                // ====== Phase G: GEMM-3: dV += P^T(smem_q) @ dO^T(smem_pds) ======
+                // ====== Phase G: FP8 GEMM-3: dV += P^T_fp8(smem_q) @ dO^T_fp8(smem_pds) ======
                 {
-                    TiledMma_G3 tiled_mma_g3;
-                    auto thr_g3 = tiled_mma_g3.get_thread_slice(tid);
-
-                    // A-operand: P^T [kBlockN x kBlockM BF16 swizzled] in smem_q
-                    Tensor sPt = make_tensor(make_smem_ptr(reinterpret_cast<ElementBf16*>(s.smem_q.data())), SmemLayoutPt{});
-                    Tensor sPt_pi = cute::as_position_independent_swizzle_tensor(sPt);
-                    auto sPt_flat = make_tensor(make_smem_ptr(reinterpret_cast<ElementBf16*>(s.smem_q.data())),
-                        make_layout(make_shape(Int<kBlockN>{}, Int<kBlockM>{})));
-                    Tensor tCrPt = thr_g3.partition_fragment_A(sPt_flat);
-                    auto cpA3 = make_tiled_copy_A(SmemCopyAtomA_BF16{}, tiled_mma_g3);
-                    auto thrA3 = cpA3.get_thread_slice(tid);
-                    Tensor tCsPt = thrA3.partition_S(sPt_pi);
-                    Tensor tCrPt_v = thrA3.retile_D(tCrPt);
-
-                    // B-operand: dO^T [kHeadDim x kBlockM BF16 swizzled] in smem_pds
-                    Tensor sdOt = make_tensor(make_smem_ptr(reinterpret_cast<ElementBf16*>(s.smem_pds.data())), SmemLayoutdOt{});
-                    Tensor sdOt_pi = cute::as_position_independent_swizzle_tensor(sdOt);
-                    auto sdOt_flat = make_tensor(make_smem_ptr(reinterpret_cast<ElementBf16*>(s.smem_pds.data())),
-                        make_layout(make_shape(Int<kHeadDim>{}, Int<kBlockM>{})));
-                    Tensor tCrdOt = thr_g3.partition_fragment_B(sdOt_flat);
-                    auto cpB3 = make_tiled_copy_B(SmemCopyAtomB_BF16{}, tiled_mma_g3);
-                    auto thrB3 = cpB3.get_thread_slice(tid);
-                    Tensor tCsdOt = thrB3.partition_S(sdOt_pi);
-                    Tensor tCrdOt_v = thrB3.retile_D(tCrdOt);
-
-                    for (int k = 0; k < size<2>(tCrPt); ++k) {
-                        copy(cpA3, tCsPt(_,_,k), tCrPt_v(_,_,k));
-                        copy(cpB3, tCsdOt(_,_,k), tCrdOt_v(_,_,k));
-                        cute::gemm(tiled_mma_g3, tCrPt(_,_,k), tCrdOt(_,_,k), tOrDV);
+                    // Reload A (P^T) from smem_q, B (dO^T) from smem_pds — reuse shared fragments
+                    for (int k = 0; k < size<2>(tCrQ_v); ++k) copy(copy_A_g1, tCsQ(_,_,k), tCrQ_v(_,_,k));
+                    for (int k = 0; k < size<2>(tCrB34_v); ++k) copy(copy_B_g34, tCsPds(_,_,k), tCrB34_v(_,_,k));
+                    for (int k = 0; k < size<2>(tCrQ); ++k) {
+                        cute::gemm(tiled_mma_g1,
+                            make_zip_tensor(tCrQ(_,_,k), tCrSFQ(_,_,k)),
+                            make_zip_tensor(tCrB34(_,_,k), tCrSFV(_,_,k)),
+                            tOrDV);
                     }
                 }
                 __syncthreads();  // sync #5: GEMM-3 reads smem_q done (before H overwrites it)
 
-                // ====== Phase H: dO BF16 -> FP8 padded -> smem_q ======
+                // ====== Phase H: dO BF16 -> FP8 padded -> smem_q (for GEMM-2) ======
                 convert_bf16_to_fp8_padded(
                     s.smem_do.data(), s.smem_q.data(),
                     kBlockM, kBlockM_SF, kHeadDim, tid, NumMmaThreads);
-
-                // ====== Phase I: Fill identity SFs in smem_sfq (parallel with H) ======
-                FwdMainloop::fill_identity_sf(s.smem_sfq.data(), cute::cosize_v<SmemLayoutAtomSFQ>,
-                    tid, NumMmaThreads);
-                __syncthreads();  // sync #6: H writes smem_q done, I writes smem_sfq done
+                __syncthreads();  // sync #6: H writes smem_q done
 
                 // ====== Phase J: GEMM-2: dP = dO_fp8(smem_q) @ V(regs) with identity SFs ======
                 {
-                    // Partition dO_fp8 A-operand from smem_q (same layout as Q in GEMM-1)
-                    Tensor sdO_fp8 = make_tensor(make_smem_ptr(s.smem_q.data()), SmemLayoutQ{});
-                    Tensor sdO_fp8_pi = cute::as_position_independent_swizzle_tensor(sdO_fp8);
-                    auto sdO_fp8_flat = make_tensor(make_smem_ptr(s.smem_q.data()),
-                        make_layout(make_shape(Int<kBlockM_SF>{}, Int<kHeadDim>{})));
-                    Tensor tCrdO_fp8 = thread_mma_g1.partition_fragment_A(sdO_fp8_flat);
-                    auto copy_A_g2 = make_tiled_copy_A(SmemCopyAtomA_G1{}, tiled_mma_g1);
-                    auto thr_copy_A_g2 = copy_A_g2.get_thread_slice(tid);
-                    Tensor tCsdO_fp8 = thr_copy_A_g2.partition_S(sdO_fp8_pi);
-                    Tensor tCrdO_fp8_v = thr_copy_A_g2.retile_D(tCrdO_fp8);
-                    for (int k = 0; k < size<2>(tCrdO_fp8_v); ++k) copy(copy_A_g2, tCsdO_fp8(_,_,k), tCrdO_fp8_v(_,_,k));
+                    // Reload A (dO_fp8) from smem_q — reuse tCrQ
+                    for (int k = 0; k < size<2>(tCrQ_v); ++k) copy(copy_A_g1, tCsQ(_,_,k), tCrQ_v(_,_,k));
 
-                    // Partition dO identity SFA from smem_sfq
-                    Tensor sSFdO = make_tensor(make_smem_ptr(reinterpret_cast<ElementSF*>(s.smem_sfq.data())),
-                        SmemLayoutAtomSFQ{});
-                    Tensor tCrSFdO = sm120_partition_fragment_SFA(sSFdO, thread_mma_g1);
-                    auto sfdO_copy = make_tiled_copy_impl(SmemCopyAtomSF{},
-                        sm120_get_layoutSFA_TV(tiled_mma_g1),
-                        make_shape(size<0>(tile_shape_g1), size<2>(tile_shape_g1)));
-                    auto sfdO_thr = sfdO_copy.get_thread_slice(tid);
-                    Tensor tCsSFdO = sfdO_thr.partition_S(sSFdO);
-                    Tensor tCrSFdO_v = sfdO_thr.retile_D(tCrSFdO);
-                    for (int k = 0; k < size<2>(tCrSFdO_v); ++k) copy(sfdO_copy, tCsSFdO(_,_,k), tCrSFdO_v(_,_,k));
-
-                    // GEMM-2: dP = dO_fp8 @ V (FP8 block-scaled MMA with identity SFs)
-                    // B-operand V and SFB_V are pre-loaded in registers (tCrV, tCrSFV)
                     Tensor acc_dp = partition_fragment_C(tiled_mma_g1, make_shape(Int<kBlockM>{}, Int<kBlockN>{}));
                     clear(acc_dp);
-                    for (int k = 0; k < size<2>(tCrdO_fp8); ++k) {
+                    for (int k = 0; k < size<2>(tCrQ); ++k) {
                         cute::gemm(tiled_mma_g1,
-                            make_zip_tensor(tCrdO_fp8(_,_,k), tCrSFdO(_,_,k)),
+                            make_zip_tensor(tCrQ(_,_,k), tCrSFQ(_,_,k)),
                             make_zip_tensor(tCrV(_,_,k), tCrSFV(_,_,k)),
                             acc_dp);
                     }
 
                     // ====== Phase K: dS = P * (dP - dPsum) * scale — IN REGISTERS ======
-                    // acc_s_rc has P, acc_dp has dP — same 8x1x1 thread mapping
                     Tensor acc_dp_rc = make_tensor(acc_dp.data(),
                         flash::convert_layout_acc_rowcol(acc_dp.layout()));
                     #pragma unroll
                     for (int mi = 0; mi < nrow_s; ++mi) {
                         int const local_row = warp_idx * 16 + (mi / 2) * 16 + lane_row + (mi % 2) * 8;
                         if (local_row >= kBlockM) {
-                            // Zero out padded rows so dS scatter writes zeros
                             #pragma unroll
                             for (int ni = 0; ni < ncol_s; ++ni) acc_s_rc(mi, ni) = 0.0f;
                             continue;
@@ -682,12 +649,15 @@ struct CollectiveMainloopBwdSm120 {
                         }
                     }
                 }
-                // acc_s_rc now holds dS values (P is consumed/overwritten)
+                // acc_s_rc now holds dS values
 
-                // ====== Phase L: dS scatter -> smem_pds ======
+                // ====== Phase LM (combined L+M): Scatter dS → smem_q as FP8 transposed padded ======
                 {
+                    int total16 = cute::cosize_v<SmemLayoutQ> / 16;
+                    for (int i = tid; i < total16; i += NumMmaThreads)
+                        reinterpret_cast<uint4*>(s.smem_q.data())[i] = make_uint4(0,0,0,0);
                     int const wm = warp_idx;
-                    auto* pds = s.smem_pds.data();
+                    auto* dst = s.smem_q.data();
                     #pragma unroll
                     for (int mi = 0; mi < nrow_s; ++mi) {
                         int const row = wm * 16 + (mi / 2) * 16 + lane_row + (mi % 2) * 8;
@@ -695,54 +665,29 @@ struct CollectiveMainloopBwdSm120 {
                         #pragma unroll
                         for (int ni = 0; ni < ncol_s; ni += 2) {
                             int const col = (ni / 2) * 8 + lane_col * 2;
-                            ElementBf16 b0 = static_cast<ElementBf16>(acc_s_rc(mi, ni));
-                            ElementBf16 b1 = static_cast<ElementBf16>(acc_s_rc(mi, ni + 1));
-                            int bo = (row * kBlockN + col) * 2;
-                            int sw = bo ^ (((bo >> 7) & 7) << 4);
-                            *reinterpret_cast<uint32_t*>(pds + sw) =
-                                uint32_t(reinterpret_cast<uint16_t const&>(b0)) |
-                                (uint32_t(reinterpret_cast<uint16_t const&>(b1)) << 16);
+                            #pragma unroll
+                            for (int i = 0; i < 2; ++i) {
+                                cutlass::float_e4m3_t fp8_val = static_cast<cutlass::float_e4m3_t>(acc_s_rc(mi, ni + i));
+                                uint8_t fp8_byte = reinterpret_cast<uint8_t const&>(fp8_val);
+                                int dst_off = (col + i) * 128 + row;
+                                int dst_sw = dst_off ^ (((dst_off >> 7) & 7) << 4);
+                                dst[dst_sw] = fp8_byte;
+                            }
                         }
                     }
                 }
-                __syncthreads();  // sync #7: dS scatter done
+                __syncthreads();  // sync #7: dS^T in smem_q visible
 
-                // ====== Phase M: dS -> dS^T -> smem_q (overwrites dO_fp8) ======
-                transpose_bf16_smem(s.smem_pds.data(), s.smem_q.data(),
-                    kBlockM, kBlockN, tid, NumMmaThreads);
-                __syncthreads();  // sync #8: dS^T in smem_q visible
-
-                // ====== Phase N: GEMM-4: dK += dS^T(smem_q) @ Q^T(smem_pt) ======
+                // ====== Phase N: FP8 GEMM-4: dK += dS^T_fp8(smem_q) @ Q^T_fp8(smem_pt) ======
                 {
-                    TiledMma_G4 tiled_mma_g4;
-                    auto thr_g4 = tiled_mma_g4.get_thread_slice(tid);
-
-                    // A-operand: dS^T [kBlockN x kBlockM BF16 swizzled] in smem_q
-                    Tensor sdSt = make_tensor(make_smem_ptr(reinterpret_cast<ElementBf16*>(s.smem_q.data())), SmemLayoutPt{});
-                    Tensor sdSt_pi = cute::as_position_independent_swizzle_tensor(sdSt);
-                    auto sdSt_flat = make_tensor(make_smem_ptr(reinterpret_cast<ElementBf16*>(s.smem_q.data())),
-                        make_layout(make_shape(Int<kBlockN>{}, Int<kBlockM>{})));
-                    Tensor tCrdSt = thr_g4.partition_fragment_A(sdSt_flat);
-                    auto cpA4 = make_tiled_copy_A(SmemCopyAtomA_BF16{}, tiled_mma_g4);
-                    auto thrA4 = cpA4.get_thread_slice(tid);
-                    Tensor tCsdSt = thrA4.partition_S(sdSt_pi);
-                    Tensor tCrdSt_v = thrA4.retile_D(tCrdSt);
-
-                    // B-operand: Q^T [kHeadDim x kBlockM BF16 swizzled] in smem_pt
-                    Tensor sQt = make_tensor(make_smem_ptr(reinterpret_cast<ElementBf16*>(s.smem_pt.data())), SmemLayoutQt{});
-                    Tensor sQt_pi = cute::as_position_independent_swizzle_tensor(sQt);
-                    auto sQt_flat = make_tensor(make_smem_ptr(reinterpret_cast<ElementBf16*>(s.smem_pt.data())),
-                        make_layout(make_shape(Int<kHeadDim>{}, Int<kBlockM>{})));
-                    Tensor tCrQt = thr_g4.partition_fragment_B(sQt_flat);
-                    auto cpB4 = make_tiled_copy_B(SmemCopyAtomB_BF16{}, tiled_mma_g4);
-                    auto thrB4 = cpB4.get_thread_slice(tid);
-                    Tensor tCsQt = thrB4.partition_S(sQt_pi);
-                    Tensor tCrQt_v = thrB4.retile_D(tCrQt);
-
-                    for (int k = 0; k < size<2>(tCrdSt); ++k) {
-                        copy(cpA4, tCsdSt(_,_,k), tCrdSt_v(_,_,k));
-                        copy(cpB4, tCsQt(_,_,k), tCrQt_v(_,_,k));
-                        cute::gemm(tiled_mma_g4, tCrdSt(_,_,k), tCrQt(_,_,k), tOrDK);
+                    // Reload A (dS^T) from smem_q, B (Q^T) from smem_pt — reuse shared fragments
+                    for (int k = 0; k < size<2>(tCrQ_v); ++k) copy(copy_A_g1, tCsQ(_,_,k), tCrQ_v(_,_,k));
+                    for (int k = 0; k < size<2>(tCrB34_v); ++k) copy(copy_B_g34, tCsPt(_,_,k), tCrB34_v(_,_,k));
+                    for (int k = 0; k < size<2>(tCrQ); ++k) {
+                        cute::gemm(tiled_mma_g1,
+                            make_zip_tensor(tCrQ(_,_,k), tCrSFQ(_,_,k)),
+                            make_zip_tensor(tCrB34(_,_,k), tCrSFV(_,_,k)),
+                            tOrDK);
                     }
                 }
 
