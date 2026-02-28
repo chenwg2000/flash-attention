@@ -1945,7 +1945,7 @@ void run_mha_bwd_mxfp8(Flash_bwd_params &params, cudaStream_t stream) {
     #endif
 }
 
-std::tuple<Tensor, Tensor>
+std::tuple<Tensor, Tensor, Tensor>
 mha_bwd_mxfp8(
     Tensor dout,        // (b, s_q, h, d), bfloat16
     Tensor q,           // (b, s_q, h, d), float8_e4m3fn
@@ -1989,11 +1989,17 @@ mha_bwd_mxfp8(
 
     STD_TORCH_CHECK(num_heads % num_heads_k == 0, "num_heads must be divisible by num_heads_k");
 
-    // Allocate outputs: dK and dV as BF16
+    // Allocate outputs: dQ, dK and dV as BF16
+    auto dq = torch::stable::new_empty(q, {batch_size, seqlen_q, num_heads, headdim},
+        std::make_optional(torch::headeronly::ScalarType::BFloat16));
     auto dk = torch::stable::new_empty(k, {batch_size, seqlen_k, num_heads_k, headdim},
         std::make_optional(torch::headeronly::ScalarType::BFloat16));
     auto dv = torch::stable::new_empty(v, {batch_size, seqlen_k, num_heads_k, headdim},
         std::make_optional(torch::headeronly::ScalarType::BFloat16));
+
+    // Allocate dQ accumulator (FP32, atomicAdded by backward kernel)
+    auto dq_accum = torch::stable::new_empty(q, {batch_size, seqlen_q, num_heads, headdim},
+        std::make_optional(torch::headeronly::ScalarType::Float));
 
     // Allocate preprocessing buffers: dPsum and LSE_log2
     auto dsoftmax_sum = torch::stable::new_empty(softmax_lse, {batch_size, num_heads, seqlen_q},
@@ -2040,6 +2046,11 @@ mha_bwd_mxfp8(
     params.dv_batch_stride = dv.stride(0);
     params.dv_row_stride = dv.stride(1);
     params.dv_head_stride = dv.stride(2);
+    params.dq_ptr = dq.data_ptr();
+    params.dq_batch_stride = dq.stride(0);
+    params.dq_row_stride = dq.stride(1);
+    params.dq_head_stride = dq.stride(2);
+    params.dq_accum_ptr = dq_accum.data_ptr();
 
     // MXFP8 scale factors
     params.q_scale_ptr = q_scale.data_ptr();
@@ -2080,10 +2091,13 @@ mha_bwd_mxfp8(
         void* stream_ptr = nullptr;
         TORCH_ERROR_CODE_CHECK(aoti_torch_get_current_cuda_stream(device_idx, &stream_ptr));
         cudaStream_t stream = static_cast<cudaStream_t>(stream_ptr);
+        // Zero dq_accum before backward kernel (atomicAdd accumulates into it)
+        cudaMemsetAsync(dq_accum.data_ptr(), 0,
+            batch_size * seqlen_q * num_heads * headdim * sizeof(float), stream);
         run_mha_bwd_mxfp8(params, stream);
     }
 
-    return {dk, dv};
+    return {dq, dk, dv};
 }
 
 void boxed_mha_bwd_mxfp8(
@@ -2102,11 +2116,12 @@ void boxed_mha_bwd_mxfp8(
     auto softmax_scale = to<double>(stack[8]);
     auto is_causal = to<bool>(stack[9]);
 
-    auto [dk, dv] = mha_bwd_mxfp8(dout, q, k, v, out, softmax_lse,
+    auto [dq, dk, dv] = mha_bwd_mxfp8(dout, q, k, v, out, softmax_lse,
         q_scale, k_scale, softmax_scale, is_causal);
 
-    stack[0] = from(dk);
-    stack[1] = from(dv);
+    stack[0] = from(dq);
+    stack[1] = from(dk);
+    stack[2] = from(dv);
 }
 
 void boxed_mha_fwd(
@@ -2330,7 +2345,7 @@ STABLE_TORCH_LIBRARY(flash_attn_3, m) {
         "Tensor q_scale,"
         "Tensor k_scale,"
         "float softmax_scale,"
-        "bool is_causal = False) -> (Tensor, Tensor)");
+        "bool is_causal = False) -> (Tensor, Tensor, Tensor)");
     m.def("get_scheduler_metadata("
         "int batch_size,"
         "int max_seqlen_q,"

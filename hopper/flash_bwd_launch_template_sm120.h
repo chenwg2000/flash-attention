@@ -1,6 +1,6 @@
 /******************************************************************************
  * SM120 MXFP8 Block-Scaled Flash Attention Backward Launch Template
- * Phase 1: dK + dV only
+ * Computes dK + dV + dQ (dQ via atomicAdd to FP32 accumulator, then BF16 postprocess)
  ******************************************************************************/
 
 #pragma once
@@ -58,7 +58,7 @@ void run_flash_bwd_sm120(Flash_bwd_params &params, cudaStream_t stream) {
         stream
     );
 
-    // ====== Step 2: Backward kernel (dK + dV) ======
+    // ====== Step 2: Backward kernel (dK + dV + dQ) ======
     typename CollectiveMainloop::Arguments mainloop_args {
         static_cast<Element const*>(params.q_ptr),
         params.q_batch_stride, params.q_row_stride, params.q_head_stride,
@@ -81,7 +81,10 @@ void run_flash_bwd_sm120(Flash_bwd_params &params, cudaStream_t stream) {
         seqlen_q,              // lse_head_stride
         params.scale_softmax,
         seqlen_q, seqlen_k,
-        num_heads, num_heads_kv, batch_size
+        num_heads, num_heads_kv, batch_size,
+        // dQ accumulator (FP32, atomicAdded by mainloop, then postprocessed to BF16)
+        static_cast<float*>(params.dq_accum_ptr),
+        params.dq_batch_stride, params.dq_row_stride, params.dq_head_stride
     };
 
     typename AttnKernel::Arguments kernel_args {
@@ -106,6 +109,13 @@ void run_flash_bwd_sm120(Flash_bwd_params &params, cudaStream_t stream) {
     }
     kernel<<<grid_dims, block_dims, smem_size, stream>>>(kernel_params);
     CHECK_CUDA_KERNEL_LAUNCH();
+
+    // ====== Step 3: Postprocess — convert dq_accum (FP32) → dq (BF16) ======
+    flash::flash_bwd_postprocess_dq_sm120(
+        params.dq_accum_ptr, params.dq_ptr,
+        batch_size, seqlen_q, num_heads, kHeadDim,
+        stream
+    );
 }
 
 template <typename T, int kHeadDim>

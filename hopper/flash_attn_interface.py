@@ -1221,11 +1221,8 @@ def flash_attn_mxfp8_bwd_func(
     causal=False,
 ):
     """MXFP8 Flash Attention Backward Pass for SM120 (RTX 5090).
-    Phase 1: computes dK and dV only (no dQ).
-
-    Uses hybrid FP8/BF16 approach:
-      - GEMM-1 (S recomputation): FP8 block-scaled MMA (matches forward)
-      - GEMMs 2-4 (gradient computation): BF16 MMA
+    Computes dQ, dK, and dV using all-FP8 block-scaled GEMMs.
+    dQ is accumulated via atomicAdd to a FP32 buffer, then converted to BF16.
 
     Arguments:
         dout: (batch_size, seqlen_q, nheads, headdim), bfloat16
@@ -1239,6 +1236,7 @@ def flash_attn_mxfp8_bwd_func(
         softmax_scale: float. Default to 1 / sqrt(headdim).
         causal: bool.
     Return:
+        dq: (batch_size, seqlen_q, nheads, headdim), bfloat16.
         dk: (batch_size, seqlen_k, nheads_kv, headdim), bfloat16.
         dv: (batch_size, seqlen_k, nheads_kv, headdim), bfloat16.
     """
@@ -1262,9 +1260,9 @@ def flash_attn_mxfp8_bwd_func(
     q_scale = q_scale.contiguous()
     k_scale = k_scale.contiguous()
 
-    dk, dv = flash_attn_3_gpu.bwd_mxfp8(
+    dq, dk, dv = flash_attn_3_gpu.bwd_mxfp8(
         dout, q, k, v, out, softmax_lse,
         q_scale, k_scale,
         softmax_scale, causal,
     )
-    return dk, dv
+    return dq, dk, dv

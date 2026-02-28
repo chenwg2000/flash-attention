@@ -108,4 +108,36 @@ inline void flash_bwd_preprocess_sm120(
     );
 }
 
+// ====== Postprocess: convert dq_accum FP32 → dq BF16 ======
+
+__global__ void flash_bwd_convert_dq_kernel_sm120(
+    float const* __restrict__ dq_accum,
+    __nv_bfloat16* __restrict__ dq,
+    int total_elements
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < total_elements) {
+        dq[idx] = __float2bfloat16(dq_accum[idx]);
+    }
+}
+
+inline void flash_bwd_postprocess_dq_sm120(
+    void const* dq_accum,
+    void* dq,
+    int batch_size,
+    int seqlen_q,
+    int num_heads,
+    int headdim,
+    cudaStream_t stream
+) {
+    int total = batch_size * seqlen_q * num_heads * headdim;
+    constexpr int kThreads = 256;
+    dim3 grid((total + kThreads - 1) / kThreads);
+    flash_bwd_convert_dq_kernel_sm120<<<grid, kThreads, 0, stream>>>(
+        static_cast<float const*>(dq_accum),
+        static_cast<__nv_bfloat16*>(dq),
+        total
+    );
+}
+
 }  // namespace flash

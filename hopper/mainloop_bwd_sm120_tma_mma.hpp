@@ -1,14 +1,16 @@
 /******************************************************************************
- * SM120 MXFP8 Block-Scaled Flash Attention Backward Mainloop (Phase 1: dK+dV)
+ * SM120 MXFP8 Block-Scaled Flash Attention Backward Mainloop (dK+dV+dQ)
  *
  * Each CTA owns one N-block (K/V block). Grid: (n_blocks, heads_kv, batch).
  * dK and dV accumulate in FP32 registers across all M-blocks, then write as BF16.
+ * dQ is computed per (M-block, N-block) pair and atomicAdded to a FP32 GMEM accumulator.
  *
  * All-FP8 block-scaled design:
  *   GEMM-1 (S = Q @ K^T):      FP8 block-scaled MMA (real SFs from GMEM)
  *   GEMM-2 (dP = dO @ V):      FP8 block-scaled MMA (identity SFs)
  *   GEMM-3 (dV += P^T @ dO^T): FP8 block-scaled MMA (identity SFs, K padded 64→128)
  *   GEMM-4 (dK += dS^T @ Q^T): FP8 block-scaled MMA (identity SFs, K padded 64→128)
+ *   GEMM-5 (dQ += dS @ K):     FP8 block-scaled MMA (identity SFs), atomicAdd to GMEM
  *
  * SMEM budget (~98 KB, fits in 101 KB):
  *   K [128x128 FP8 SW128]:  16 KB (resident)
@@ -181,6 +183,8 @@ struct CollectiveMainloopBwdSm120 {
         float softmax_scale;
         int seqlen_q, seqlen_k;
         int num_heads, num_heads_kv, batch_size;
+        float* ptr_dq_accum;
+        int64_t dq_accum_batch_stride, dq_accum_row_stride, dq_accum_head_stride;
     };
 
     struct Params {
@@ -201,6 +205,8 @@ struct CollectiveMainloopBwdSm120 {
         int seqlen_q, seqlen_k;
         int num_m_blocks;
         int qhead_per_khead;
+        float* ptr_dq_accum;
+        int64_t dq_accum_batch_stride, dq_accum_row_stride, dq_accum_head_stride;
     };
 
     static Params to_underlying_arguments(Arguments const& a) {
@@ -215,7 +221,8 @@ struct CollectiveMainloopBwdSm120 {
                 a.softmax_scale, float(a.softmax_scale * M_LOG2E),
                 a.seqlen_q, a.seqlen_k,
                 cute::ceil_div(a.seqlen_q, kBlockM),
-                a.num_heads / a.num_heads_kv};
+                a.num_heads / a.num_heads_kv,
+                a.ptr_dq_accum, a.dq_accum_batch_stride, a.dq_accum_row_stride, a.dq_accum_head_stride};
     }
 
     // ====== BF16 -> FP8 transpose + pad: [rows x cols] BF16 SW128 -> [cols x 128] FP8 SW128 ======
@@ -420,6 +427,12 @@ struct CollectiveMainloopBwdSm120 {
         Tensor sPt_fp8 = make_tensor(make_smem_ptr(s.smem_pt.data()), SmemLayoutK{});
         Tensor sPt_fp8_pi = cute::as_position_independent_swizzle_tensor(sPt_fp8);
         Tensor tCsPt = thr_copy_B_g34.partition_S(sPt_fp8_pi);
+
+        // ====== Set up A-partition for GEMM-5: dS (non-transposed) from smem_pds ======
+        // smem_pds (16KB BF16 [64x128]) reinterpreted as FP8 [128x128] for SmemLayoutQ
+        Tensor sPds_A = make_tensor(make_smem_ptr(s.smem_pds.data()), SmemLayoutQ{});
+        Tensor sPds_A_pi = cute::as_position_independent_swizzle_tensor(sPds_A);
+        Tensor tCsPds_A = thr_copy_A_g1.partition_S(sPds_A_pi);
 
         int const warp_idx = tid / 32;
         int const lane_idx = tid % 32;
@@ -651,13 +664,17 @@ struct CollectiveMainloopBwdSm120 {
                 }
                 // acc_s_rc now holds dS values
 
-                // ====== Phase LM (combined L+M): Scatter dS → smem_q as FP8 transposed padded ======
+                // ====== Phase LM (dual scatter): dS → smem_q (transposed) + smem_pds (non-transposed) ======
                 {
+                    // Zero both smem_q (for dS^T, GEMM-4) and smem_pds (for dS, GEMM-5)
                     int total16 = cute::cosize_v<SmemLayoutQ> / 16;
-                    for (int i = tid; i < total16; i += NumMmaThreads)
+                    for (int i = tid; i < total16; i += NumMmaThreads) {
                         reinterpret_cast<uint4*>(s.smem_q.data())[i] = make_uint4(0,0,0,0);
+                        reinterpret_cast<uint4*>(s.smem_pds.data())[i] = make_uint4(0,0,0,0);
+                    }
                     int const wm = warp_idx;
-                    auto* dst = s.smem_q.data();
+                    auto* dst_q = s.smem_q.data();
+                    auto* dst_pds = s.smem_pds.data();
                     #pragma unroll
                     for (int mi = 0; mi < nrow_s; ++mi) {
                         int const row = wm * 16 + (mi / 2) * 16 + lane_row + (mi % 2) * 8;
@@ -669,14 +686,52 @@ struct CollectiveMainloopBwdSm120 {
                             for (int i = 0; i < 2; ++i) {
                                 cutlass::float_e4m3_t fp8_val = static_cast<cutlass::float_e4m3_t>(acc_s_rc(mi, ni + i));
                                 uint8_t fp8_byte = reinterpret_cast<uint8_t const&>(fp8_val);
-                                int dst_off = (col + i) * 128 + row;
-                                int dst_sw = dst_off ^ (((dst_off >> 7) & 7) << 4);
-                                dst[dst_sw] = fp8_byte;
+                                // Transposed write to smem_q: dS^T[col+i][row] (for GEMM-4)
+                                int dst_off_t = (col + i) * 128 + row;
+                                int dst_sw_t = dst_off_t ^ (((dst_off_t >> 7) & 7) << 4);
+                                dst_q[dst_sw_t] = fp8_byte;
+                                // Non-transposed write to smem_pds: dS[row][col+i] (for GEMM-5)
+                                int dst_off_n = row * 128 + (col + i);
+                                int dst_sw_n = dst_off_n ^ (((dst_off_n >> 7) & 7) << 4);
+                                dst_pds[dst_sw_n] = fp8_byte;
                             }
                         }
                     }
                 }
-                __syncthreads();  // sync #7: dS^T in smem_q visible
+                __syncthreads();  // sync #7: dS^T in smem_q + dS in smem_pds visible
+
+                // ====== GEMM-5 (NEW): dQ_local = dS_fp8(smem_pds) @ K_fp8(smem_k), then atomicAdd ======
+                {
+                    // Load A (dS non-transposed) from smem_pds, B (K) from smem_k
+                    for (int k = 0; k < size<2>(tCrQ_v); ++k) copy(copy_A_g1, tCsPds_A(_,_,k), tCrQ_v(_,_,k));
+                    for (int k = 0; k < size<2>(tCrK_v); ++k) copy(copy_B_g1, tCsK(_,_,k), tCrK_v(_,_,k));
+
+                    Tensor acc_dq = partition_fragment_C(tiled_mma_g1, make_shape(Int<kBlockM>{}, Int<kHeadDim>{}));
+                    clear(acc_dq);
+                    for (int k = 0; k < size<2>(tCrQ); ++k) {
+                        cute::gemm(tiled_mma_g1,
+                            make_zip_tensor(tCrQ(_,_,k), tCrSFQ(_,_,k)),
+                            make_zip_tensor(tCrK(_,_,k), tCrSFV(_,_,k)),
+                            acc_dq);
+                    }
+
+                    // AtomicAdd acc_dq to dq_accum in GMEM
+                    Tensor acc_dq_rc = make_tensor(acc_dq.data(),
+                        flash::convert_layout_acc_rowcol(acc_dq.layout()));
+                    float* dq_base = p.ptr_dq_accum + bidb * p.dq_accum_batch_stride + bidh * p.dq_accum_head_stride;
+                    #pragma unroll
+                    for (int mi = 0; mi < size<0>(acc_dq_rc); ++mi) {
+                        int const row = m_start + warp_idx * 16 + (mi / 2) * 16 + lane_row + (mi % 2) * 8;
+                        if (row >= p.seqlen_q || row >= m_start + kBlockM) continue;
+                        #pragma unroll
+                        for (int ni = 0; ni < size<1>(acc_dq_rc); ++ni) {
+                            int const col = (ni / 2) * 8 + lane_col * 2 + (ni % 2);
+                            if (col < kHeadDim) {
+                                atomicAdd(&dq_base[row * p.dq_accum_row_stride + col], acc_dq_rc(mi, ni));
+                            }
+                        }
+                    }
+                }
 
                 // ====== Phase N: FP8 GEMM-4: dK += dS^T_fp8(smem_q) @ Q^T_fp8(smem_pt) ======
                 {
