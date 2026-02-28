@@ -440,7 +440,8 @@ struct CollectiveMainloopBwdSm120 {
         int const lane_col = lane_idx % 4;
 
         // ====== M-block loop ======
-        for (int m_blk = 0; m_blk < p.num_m_blocks; ++m_blk) {
+        int const m_block_min = Is_causal ? (n_block * kBlockN / kBlockM) : 0;
+        for (int m_blk = m_block_min; m_blk < p.num_m_blocks; ++m_blk) {
             int const m_start = m_blk * kBlockM;
 
             for (int qh_off = 0; qh_off < p.qhead_per_khead; ++qh_off) {
