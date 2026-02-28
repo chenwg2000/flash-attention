@@ -594,6 +594,17 @@ if not SKIP_CUDA_BUILD:
     sources_fwd_sm120 = [f"instantiations/flash_fwd_hdim{hdim}_{dtype}_sm120.cu"
                          for hdim, dtype in itertools.product(HEAD_DIMENSIONS_FWD_SM120, DTYPE_FWD_SM120)]
 
+    # SM120 backward (Phase 1: dK + dV)
+    DTYPE_BWD_SM120 = ["e4m3"] if not DISABLE_FP8 else []
+    HEAD_DIMENSIONS_BWD_SM120 = (
+        []
+        + ([128] if not DISABLE_HDIM128 else [])
+    )
+    sources_bwd_sm120 = [f"instantiations/flash_bwd_hdim{hdim}_{dtype}_sm120.cu"
+                         for hdim, dtype in itertools.product(HEAD_DIMENSIONS_BWD_SM120, DTYPE_BWD_SM120)]
+    if DISABLE_BACKWARD:
+        sources_bwd_sm120 = []
+
     # Choose between flash_api.cpp and flash_api_stable.cpp based on torch version
     torch_version = parse(torch.__version__)
     target_version = parse("2.9.0.dev20250830")
@@ -608,7 +619,7 @@ if not SKIP_CUDA_BUILD:
     sources = (
         [flash_api_source]
         + (sources_fwd_sm80 if not DISABLE_SM8x else []) + sources_fwd_sm90 + sources_fwd_sm120
-        + (sources_bwd_sm80 if not DISABLE_SM8x else []) + sources_bwd_sm90
+        + (sources_bwd_sm80 if not DISABLE_SM8x else []) + sources_bwd_sm90 + sources_bwd_sm120
     )
     if not DISABLE_SPLIT:
         sources += ["flash_fwd_combine.cu"]

@@ -242,3 +242,7 @@ void run_mha_fwd_combine_(Flash_fwd_params &params, cudaStream_t stream, bool en
 // SM120 MXFP8 block-scaled forward pass
 template <typename T, int kHeadDim>
 void run_mha_fwd_sm120_(Flash_fwd_params &params, cudaStream_t stream);
+
+// SM120 MXFP8 block-scaled backward pass (Phase 1: dK + dV)
+template <typename T, int kHeadDim>
+void run_mha_bwd_sm120_(Flash_bwd_params &params, cudaStream_t stream);

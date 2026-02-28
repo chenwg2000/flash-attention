@@ -1206,3 +1206,65 @@ def flash_attn_mxfp8_func(
         softmax_scale, causal, softcap,
     )
     return out, softmax_lse
+
+
+def flash_attn_mxfp8_bwd_func(
+    dout,
+    q,
+    k,
+    v,
+    out,
+    softmax_lse,
+    q_scale,
+    k_scale,
+    softmax_scale=None,
+    causal=False,
+):
+    """MXFP8 Flash Attention Backward Pass for SM120 (RTX 5090).
+    Phase 1: computes dK and dV only (no dQ).
+
+    Uses hybrid FP8/BF16 approach:
+      - GEMM-1 (S recomputation): FP8 block-scaled MMA (matches forward)
+      - GEMMs 2-4 (gradient computation): BF16 MMA
+
+    Arguments:
+        dout: (batch_size, seqlen_q, nheads, headdim), bfloat16
+        q: (batch_size, seqlen_q, nheads, headdim), float8_e4m3fn
+        k: (batch_size, seqlen_k, nheads_kv, headdim), float8_e4m3fn
+        v: (batch_size, seqlen_k, nheads_kv, headdim), float8_e4m3fn
+        out: (batch_size, seqlen_q, nheads, headdim), bfloat16 (from forward)
+        softmax_lse: (batch_size, nheads, seqlen_q), float32 (from forward)
+        q_scale: (batch_size, nheads, seqlen_q, ceil(headdim/32)), uint8 UE8M0
+        k_scale: (batch_size, nheads_kv, seqlen_k, ceil(headdim/32)), uint8 UE8M0
+        softmax_scale: float. Default to 1 / sqrt(headdim).
+        causal: bool.
+    Return:
+        dk: (batch_size, seqlen_k, nheads_kv, headdim), bfloat16.
+        dv: (batch_size, seqlen_k, nheads_kv, headdim), bfloat16.
+    """
+    assert dout.dtype == torch.bfloat16, "dout must be bfloat16"
+    assert q.dtype == torch.float8_e4m3fn, "q must be float8_e4m3fn"
+    assert k.dtype == torch.float8_e4m3fn, "k must be float8_e4m3fn"
+    assert v.dtype == torch.float8_e4m3fn, "v must be float8_e4m3fn"
+    assert out.dtype == torch.bfloat16, "out must be bfloat16"
+    assert q_scale.dtype == torch.uint8, "q_scale must be uint8 (UE8M0)"
+    assert k_scale.dtype == torch.uint8, "k_scale must be uint8 (UE8M0)"
+
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+
+    dout = dout.contiguous()
+    q = q.contiguous()
+    k = k.contiguous()
+    v = v.contiguous()
+    out = out.contiguous()
+    softmax_lse = softmax_lse.contiguous()
+    q_scale = q_scale.contiguous()
+    k_scale = k_scale.contiguous()
+
+    dk, dv = flash_attn_3_gpu.bwd_mxfp8(
+        dout, q, k, v, out, softmax_lse,
+        q_scale, k_scale,
+        softmax_scale, causal,
+    )
+    return dk, dv
