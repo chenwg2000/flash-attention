@@ -175,14 +175,14 @@ For causal attention:
   - Lean entry point: Q/K/V (FP8) + q_scale/k_scale/v_scale (UE8M0) + softmax_scale + causal
   - Registered as `flash_attn_3.fwd_mxfp8` via `STABLE_TORCH_LIBRARY`
   - Populates `Flash_fwd_params` scale pointers and strides
-- **Fixed scale factor SMEM layout** to match CUTLASS block-scaled interleaved format
-  - `load_sf` was writing row-major but MMA partition reads in `SfKMajorAtom` format
-  - Correct formula: `SMEM_offset(row, col) = (row % 32) * 16 + (row / 32) * 4 + col`
-  - This interleaving comes from `Shape<32,4> Stride<16,4>` in the CUTLASS block-scaled atom
-  - With identity scales (all 127) the bug was harmless; non-uniform scales were scrambled
-- **Verified with non-identity scales** (2^-3 to 2^4 per block):
-  - Correct scales: LSE diff = 0.000006 vs dequantized reference
-  - Identity scales: LSE diff = 33.19 vs scaled reference (proves scales take effect)
+- **Verified with non-identity scales** using kernel-vs-kernel cross-check:
+  - `kernel(data, sf)` == `kernel(prescaled_data, identity_sf)` within LSE < 0.001
+  - Requires small data to avoid FP8 overflow in prescaling (kernel applies SF in FP32 accumulator)
+  - Uniform scales: exact match at all sequence lengths (sf=130 == identity+64x softmax_scale)
+  - Per-row varying scales: LSE diff < 0.001 across configs up to (2,1024,4,128)
+- **Comprehensive test suite** (9 tests, all passing) in `test_sm120.py`
+- **V scale factors**: accepted by API but not applied in GEMM-II (identity P/V^T SFs).
+  V scaling would require transposed SF support in the V^T SMEM layout.
 
 ---
 
@@ -190,14 +190,19 @@ For causal attention:
 
 ### Correctness
 
-| Test | Result | Details |
-|------|--------|---------|
-| Basic Launch | PASS | O finite, reasonable range |
-| LSE Correctness | PASS | LSE diff = 0.0000 (exact match vs reference) |
-| Output Correctness (non-causal) | PASS | O max diff = 0.013 at s=256; scales with seqlen due to FP8 accumulation |
-| Identity Attention | PASS | O diff = 0.0001, LSE diff = 0.0000 |
-| Causal Correctness | PASS | LSE exact match; O diff higher for early rows (few valid K-positions amplify FP8 error) |
-| MXFP8 Scale Factors | PASS | Non-identity scales: LSE diff = 0.000006 vs dequantized reference |
+| # | Test | Method | Result |
+|---|------|--------|--------|
+| 1 | Identity scales match legacy | `mxfp8(id)` == `_flash_attn_forward` | exact 0.0, 4 configs |
+| 2 | Uniform non-identity scales | `sf=130` == `identity + 64x scale` | exact 0.0, s=128..2048 |
+| 3 | Scale factors applied | `kernel(sf)` == `kernel(prescaled, id)` | LSE < 0.001, 4 configs |
+| 4 | Per-row varying scales | prescale cross-check | LSE = 0.0005 |
+| 5 | Causal + non-identity scales | prescale cross-check | LSE < 0.001, 2 configs |
+| 6 | FP32 reference sanity | kernel vs FP32 dequantized ref | LSE < 0.05, O < 0.05 |
+| 7 | Batch/head consistency | batched == individual | exact 0.0 |
+| 8 | Extreme scale values (2^10) | finite output, LSE changes | PASS |
+| 9 | V scales not applied | documented: identity P/V^T in GEMM-II | exact 0.0 |
+
+Test methodology: Scale factor correctness is verified by comparing `kernel(data, sf)` against `kernel(prescaled_data, identity_sf)`. Both paths should produce identical results. This requires small input data (~0.01 magnitude) to avoid FP8 overflow during prescaling, since the kernel applies SF in the FP32 MMA accumulator while prescaling goes through FP8 requantization (max 448).
 
 ### Performance (median of 100 runs)
 
@@ -255,13 +260,6 @@ Replacing `UniversalCopy<uint8_t>` with LDSM (`SM75_U32x{2,4}_LDSM_N`) required:
 - **`as_position_independent_swizzle_tensor`**: Required to convert composed-layout tensors for CuTe `partition_S`. Requires 1024-byte SMEM alignment (`alignas(1024)`).
 - **`partition_fragment_A/B` with flat layout**: Register fragments depend only on tile shape, not swizzle; using a flat (non-swizzled) layout avoids composed-layout issues in the MMA partition.
 - **B-operand uses U32x2**: With 8x1x1 warp layout, the B-operand tile is only 8x32 = 256 bytes = 8 bytes/thread, requiring `SM75_U32x2_LDSM_N` instead of `SM75_U32x4_LDSM_N`.
-
-### Scale Factor SMEM Layout (Block-Scaled Interleaving)
-CUTLASS's block-scaled MMA expects scale factors in an interleaved SMEM format, not simple row-major. The `SfKMajorAtom` layout uses `Shape<32,4> Stride<16,4>`, which interleaves 4 groups of 32 rows:
-```
-SMEM_offset(row, col) = (row % 32) * 16 + (row / 32) * 4 + col
-```
-Row 0 at offset 0, row 1 at 16, ..., row 31 at 496, row 32 at 4, row 33 at 20, etc. This packs scale factors from 4 row-groups into each 16-byte SMEM block for efficient MMA access. The `load_sf` cooperative load must write to these interleaved positions rather than sequential row-major order.
 
 ### ODR-Use of Static Constexpr in Device Code
 `static constexpr int kStages` triggers undefined symbol errors in CUDA device code on certain compiler configurations. Resolved by copying to a local variable: `int const num_stages = kStages_;`.
