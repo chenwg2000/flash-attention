@@ -440,19 +440,30 @@ struct CollectiveMainloopBwdSm120 {
 
                 __syncthreads();  // sync #1: Q + SFQ visible
 
-                // ====== Phase B: GEMM-1 (S = Q@K^T) ======
-                for (int k = 0; k < size<2>(tCrQ_v); ++k) copy(copy_A_g1, tCsQ(_,_,k), tCrQ_v(_,_,k));
-                for (int k = 0; k < size<2>(tCrSFQ_v); ++k) copy(sfq_copy, tCsSFQ(_,_,k), tCrSFQ_v(_,_,k));
-                for (int k = 0; k < size<2>(tCrK_v); ++k) copy(copy_B_g1, tCsK(_,_,k), tCrK_v(_,_,k));
-                for (int k = 0; k < size<2>(tCrSFK_v); ++k) copy(sfk_copy, tCsSFK(_,_,k), tCrSFK_v(_,_,k));
-
+                // ====== Phase B: GEMM-1 (S = Q@K^T) — software-pipelined LDSM/MMA ======
                 Tensor acc_s = partition_fragment_C(tiled_mma_g1, make_shape(Int<kBlockM>{}, Int<kBlockN>{}));
                 clear(acc_s);
-                for (int k = 0; k < size<2>(tCrQ); ++k) {
-                    cute::gemm(tiled_mma_g1,
-                        make_zip_tensor(tCrQ(_,_,k), tCrSFQ(_,_,k)),
-                        make_zip_tensor(tCrK(_,_,k), tCrSFK(_,_,k)),
-                        acc_s);
+                {
+                    static constexpr int kG1Iters = decltype(size<2>(tCrQ))::value;
+                    // Prologue: load k=0
+                    copy(copy_A_g1, tCsQ(_,_,0), tCrQ_v(_,_,0));
+                    copy(sfq_copy, tCsSFQ(_,_,0), tCrSFQ_v(_,_,0));
+                    copy(copy_B_g1, tCsK(_,_,0), tCrK_v(_,_,0));
+                    copy(sfk_copy, tCsSFK(_,_,0), tCrSFK_v(_,_,0));
+                    // Main loop: LDSM[k+1] overlaps with MMA[k]
+                    #pragma unroll
+                    for (int k = 0; k < kG1Iters; ++k) {
+                        if (k + 1 < kG1Iters) {
+                            copy(copy_A_g1, tCsQ(_,_,k+1), tCrQ_v(_,_,k+1));
+                            copy(sfq_copy, tCsSFQ(_,_,k+1), tCrSFQ_v(_,_,k+1));
+                            copy(copy_B_g1, tCsK(_,_,k+1), tCrK_v(_,_,k+1));
+                            copy(sfk_copy, tCsSFK(_,_,k+1), tCrSFK_v(_,_,k+1));
+                        }
+                        cute::gemm(tiled_mma_g1,
+                            make_zip_tensor(tCrQ(_,_,k), tCrSFQ(_,_,k)),
+                            make_zip_tensor(tCrK(_,_,k), tCrSFK(_,_,k)),
+                            acc_s);
+                    }
                 }
 
                 // ====== Phase B': Fill smem_sfq with identity SFs ======
@@ -542,17 +553,24 @@ struct CollectiveMainloopBwdSm120 {
                 // Reload identity SFs
                 for (int k = 0; k < size<2>(tCrSFQ_v); ++k) copy(sfq_copy, tCsSFQ(_,_,k), tCrSFQ_v(_,_,k));
 
-                // ====== Phase J: GEMM-2: dP = dO_fp8(smem_pds) @ V(regs) ======
+                // ====== Phase J: GEMM-2: dP = dO_fp8(smem_pds) @ V(regs) — pipelined ======
                 {
-                    for (int k = 0; k < size<2>(tCrQ_v); ++k) copy(copy_A_g1, tCsPds_A(_,_,k), tCrQ_v(_,_,k));
-
                     Tensor acc_dp = partition_fragment_C(tiled_mma_g1, make_shape(Int<kBlockM>{}, Int<kBlockN>{}));
                     clear(acc_dp);
-                    for (int k = 0; k < size<2>(tCrQ); ++k) {
-                        cute::gemm(tiled_mma_g1,
-                            make_zip_tensor(tCrQ(_,_,k), tCrSFQ(_,_,k)),
-                            make_zip_tensor(tCrV(_,_,k), tCrSFV(_,_,k)),
-                            acc_dp);
+                    {
+                        static constexpr int kG2Iters = decltype(size<2>(tCrQ))::value;
+                        // Prologue: load A[0] (B=V already in regs)
+                        copy(copy_A_g1, tCsPds_A(_,_,0), tCrQ_v(_,_,0));
+                        #pragma unroll
+                        for (int k = 0; k < kG2Iters; ++k) {
+                            if (k + 1 < kG2Iters) {
+                                copy(copy_A_g1, tCsPds_A(_,_,k+1), tCrQ_v(_,_,k+1));
+                            }
+                            cute::gemm(tiled_mma_g1,
+                                make_zip_tensor(tCrQ(_,_,k), tCrSFQ(_,_,k)),
+                                make_zip_tensor(tCrV(_,_,k), tCrSFV(_,_,k)),
+                                acc_dp);
+                        }
                     }
 
                     // ====== Phase E: Scatter P → smem_q as FP8 transposed ======
@@ -601,12 +619,18 @@ struct CollectiveMainloopBwdSm120 {
                 }
                 __syncthreads();  // sync #3: E+F done (smem_q has P^T, smem_pds has dO^T)
 
-                // ====== Phase G: GEMM-3: dV += P^T_fp8(smem_q) @ dO^T_fp8(smem_pds) ======
-                static constexpr int kIters34 = kBlockM / 32;  // = 4 (all K-chunks valid)
+                // ====== Phase G: GEMM-3: dV += P^T_fp8(smem_q) @ dO^T_fp8(smem_pds) — pipelined ======
+                static constexpr int kIters34 = kBlockM / 32;  // = 4
                 {
-                    for (int k = 0; k < kIters34; ++k) copy(copy_A_g1, tCsQ(_,_,k), tCrQ_v(_,_,k));
-                    for (int k = 0; k < kIters34; ++k) copy(copy_B_g34, tCsPds(_,_,k), tCrB34_v(_,_,k));
+                    // Prologue: load k=0
+                    copy(copy_A_g1, tCsQ(_,_,0), tCrQ_v(_,_,0));
+                    copy(copy_B_g34, tCsPds(_,_,0), tCrB34_v(_,_,0));
+                    #pragma unroll
                     for (int k = 0; k < kIters34; ++k) {
+                        if (k + 1 < kIters34) {
+                            copy(copy_A_g1, tCsQ(_,_,k+1), tCrQ_v(_,_,k+1));
+                            copy(copy_B_g34, tCsPds(_,_,k+1), tCrB34_v(_,_,k+1));
+                        }
                         cute::gemm(tiled_mma_g1,
                             make_zip_tensor(tCrQ(_,_,k), tCrSFQ(_,_,k)),
                             make_zip_tensor(tCrB34(_,_,k), tCrSFV(_,_,k)),
@@ -642,18 +666,26 @@ struct CollectiveMainloopBwdSm120 {
                 }
                 __syncthreads();  // sync #5: dS^T in smem_q + dS in smem_pds visible
 
-                // ====== GEMM-5: dQ_local = dS_fp8(smem_pds) @ K_fp8(smem_k), then atomicAdd ======
+                // ====== GEMM-5: dQ_local = dS_fp8(smem_pds) @ K_fp8(smem_k) — pipelined ======
                 {
-                    for (int k = 0; k < size<2>(tCrQ_v); ++k) copy(copy_A_g1, tCsPds_A(_,_,k), tCrQ_v(_,_,k));
-                    for (int k = 0; k < size<2>(tCrK_v); ++k) copy(copy_B_g1, tCsK(_,_,k), tCrK_v(_,_,k));
-
                     Tensor acc_dq = partition_fragment_C(tiled_mma_g1, make_shape(Int<kBlockM>{}, Int<kHeadDim>{}));
                     clear(acc_dq);
-                    for (int k = 0; k < size<2>(tCrQ); ++k) {
-                        cute::gemm(tiled_mma_g1,
-                            make_zip_tensor(tCrQ(_,_,k), tCrSFQ(_,_,k)),
-                            make_zip_tensor(tCrK(_,_,k), tCrSFV(_,_,k)),
-                            acc_dq);
+                    {
+                        static constexpr int kG5Iters = decltype(size<2>(tCrQ))::value;
+                        // Prologue: load k=0
+                        copy(copy_A_g1, tCsPds_A(_,_,0), tCrQ_v(_,_,0));
+                        copy(copy_B_g1, tCsK(_,_,0), tCrK_v(_,_,0));
+                        #pragma unroll
+                        for (int k = 0; k < kG5Iters; ++k) {
+                            if (k + 1 < kG5Iters) {
+                                copy(copy_A_g1, tCsPds_A(_,_,k+1), tCrQ_v(_,_,k+1));
+                                copy(copy_B_g1, tCsK(_,_,k+1), tCrK_v(_,_,k+1));
+                            }
+                            cute::gemm(tiled_mma_g1,
+                                make_zip_tensor(tCrQ(_,_,k), tCrSFQ(_,_,k)),
+                                make_zip_tensor(tCrK(_,_,k), tCrSFV(_,_,k)),
+                                acc_dq);
+                        }
                     }
 
                     Tensor acc_dq_rc = make_tensor(acc_dq.data(),
@@ -673,11 +705,17 @@ struct CollectiveMainloopBwdSm120 {
                     }
                 }
 
-                // ====== Phase N: GEMM-4: dK += dS^T_fp8(smem_q) @ Q^T_fp8(smem_pt) ======
+                // ====== Phase N: GEMM-4: dK += dS^T_fp8(smem_q) @ Q^T_fp8(smem_pt) — pipelined ======
                 {
-                    for (int k = 0; k < kIters34; ++k) copy(copy_A_g1, tCsQ(_,_,k), tCrQ_v(_,_,k));
-                    for (int k = 0; k < kIters34; ++k) copy(copy_B_g34, tCsPt(_,_,k), tCrB34_v(_,_,k));
+                    // Prologue: load k=0
+                    copy(copy_A_g1, tCsQ(_,_,0), tCrQ_v(_,_,0));
+                    copy(copy_B_g34, tCsPt(_,_,0), tCrB34_v(_,_,0));
+                    #pragma unroll
                     for (int k = 0; k < kIters34; ++k) {
+                        if (k + 1 < kIters34) {
+                            copy(copy_A_g1, tCsQ(_,_,k+1), tCrQ_v(_,_,k+1));
+                            copy(copy_B_g34, tCsPt(_,_,k+1), tCrB34_v(_,_,k+1));
+                        }
                         cute::gemm(tiled_mma_g1,
                             make_zip_tensor(tCrQ(_,_,k), tCrSFQ(_,_,k)),
                             make_zip_tensor(tCrB34(_,_,k), tCrSFV(_,_,k)),
