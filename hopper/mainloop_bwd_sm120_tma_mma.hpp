@@ -455,9 +455,11 @@ struct CollectiveMainloopBwdSm120 {
                         acc_s);
                 }
 
-                // ====== Phase B': Fill smem_sfq with identity SFs ======
-                FwdMainloop::fill_identity_sf(s.smem_sfq.data(), cute::cosize_v<SmemLayoutAtomSFQ>,
-                    tid, NumMmaThreads);
+                // ====== Phase B': Refill tCrSFQ with identity SFs (register-only, no SMEM) ======
+                #pragma unroll
+                for (int i = 0; i < size(tCrSFQ); ++i) {
+                    reinterpret_cast<uint8_t&>(tCrSFQ(i)) = 0x7F;  // identity: 2^0 = 1.0 in UE8M0
+                }
 
                 // ====== Phase C: Causal mask + seqlen mask + softmax ======
                 if constexpr (Is_causal) {
@@ -539,8 +541,7 @@ struct CollectiveMainloopBwdSm120 {
                 }
                 __syncthreads();  // sync #2: D+H done (smem_pt has Q^T, smem_pds has dO_fp8)
 
-                // Reload identity SFs
-                for (int k = 0; k < size<2>(tCrSFQ_v); ++k) copy(sfq_copy, tCsSFQ(_,_,k), tCrSFQ_v(_,_,k));
+                // Identity SFs already in tCrSFQ registers (set in Phase B')
 
                 // ====== Phase J: GEMM-2: dP = dO_fp8(smem_pds) @ V(regs) ======
                 {
