@@ -1,201 +1,117 @@
-# SM120 Backward Kernel Optimization Analysis (Updated)
+# SM120 Backward Kernel Optimization Analysis (Final)
 
-## Current State (after kBlockM=128 + GMEM dO)
+## Current State (kBlockM=128 + GMEM dO + software-pipelined LDSM/MMA)
 
 | Config | SM120 FP8 bwd | SDPA BF16 bwd | Gap |
 |---|---|---|---|
-| (1,2048,32,128,F) | 2.212 ms (97.6 TFLOPS f+b) | 0.949 ms (176 TFLOPS f+b) | 2.3x slower |
-| (4,2048,32,128,F) | 8.848 ms (99.8 TFLOPS f+b) | 3.590 ms (194 TFLOPS f+b) | 2.5x slower |
-| (1,4096,32,128,C) | 3.854 ms (111.8 TFLOPS f+b) | 1.825 ms (185 TFLOPS f+b) | 2.1x slower |
-| (4,2048,32,128,C) | 4.179 ms (103.3 TFLOPS f+b) | 2.098 ms (169 TFLOPS f+b) | 2.0x slower |
+| (1,2048,32,128,F) | 2.179 ms | 0.952 ms | 2.3x slower |
+| (4,2048,32,128,F) | 8.849 ms | 3.589 ms | 2.5x slower |
+| (1,4096,32,128,C) | 3.876 ms | 1.823 ms | 2.1x slower |
+| (4,2048,32,128,C) | 4.181 ms | 2.098 ms | 2.0x slower |
 
 Forward achieves 347 TFLOPS (1.7x faster than BF16). Backward is the entire gap.
 
-## What We've Tried and Learned
+## Complete Optimization History
 
 | Optimization | Result | Key Learning |
 |---|---|---|
-| Warp specialization (4+4 split) | -4 to -8% (worse) | TC saturates better with 8 warps (even wasted). 255 regs = no branch headroom. |
-| Zero-fill elimination | -1 to -2% (worse) | Vectorized uint4 zero-fill + `continue` beats per-byte conditional writes. |
-| TMA bulk reduce for dQ | ~neutral | Blackwell L2 atomicAdd is fast (~2 cycles amortized). Not the bottleneck. |
-| **kBlockM=128 + GMEM dO** | **+8 to +22%** ✅ | Big win from halving M-blocks + eliminating all padding/zero-fill waste. |
+| Warp specialization (4+4 split) | **-4 to -8%** (worse) | TC saturates better with 8 warps. 255 regs = no branch headroom. |
+| Zero-fill elimination | **-1 to -2%** (worse) | Vectorized uint4 + `continue` beats per-byte conditional writes. |
+| TMA bulk reduce for dQ | **~neutral** | Blackwell L2 atomicAdd already fast (~2 cycles amortized). |
+| **kBlockM=128 + GMEM dO** | **+8 to +22%** ✅ | Big win: halved M-blocks, no padding/zero-fill, reduced spills. |
+| Software-pipelined LDSM/MMA | **~neutral** | 8-warp scheduler provides sufficient inter-warp overlap. |
 
-Hardware constraints discovered:
-- RTX 5090 (SM 12.0): **only 100 KB SMEM per SM** (not 228 KB like Hopper/B100)
-- Pre-existing register spills: 1440B stores + 1440B loads (improved from 1624/1744)
-- Block-scaled MMA Blk_MN=128 forces 128-row MMA tile regardless of kBlockM
+### What works on SM120:
+- **Structural changes** that reduce total M-block count or eliminate overhead phases
+- **Eliminating SMEM buffers** by reading from GMEM/L2 cache
+- **Causal early-exit** (skipping fully-masked M-blocks)
 
-## Where Time Goes Now (per M-block, estimated)
+### What doesn't work on SM120:
+- **Warp specialization**: TC needs all 8 warps for pipeline utilization
+- **Zero-fill elimination**: Vectorized uint4 + skip is already optimal
+- **TMA bulk reduce**: Blackwell L2 handles atomicAdds efficiently
+- **Intra-warp LDSM/MMA pipelining**: Inter-warp overlap is sufficient with 8 warps
+- **Any change adding register pressure**: 255 regs at limit, spills kill performance
 
-Config: (1,2048,32,128,F), 16 M-blocks per CTA, ~46 µs per M-block
+## The Fundamental Bottleneck: FP32→FP8 Conversion Chain
 
-The forward achieves ~5.3 µs per N-block (2 GEMMs + softmax + TMA-pipelined K/V loads).
-The backward takes ~46 µs per M-block (5 GEMMs + 5 convert/scatter phases + 6 syncs).
-
-### Why the backward is 8.7x slower per-tile than the forward (with 2.5x more GEMMs)
-
-The 3.5x overhead ratio (8.7x / 2.5x) breaks down into:
-
-**1. The FP32→FP8→SMEM→LDSM round-trip chain (~60% of overhead)**
-
-The core bottleneck. Between every pair of GEMMs, the backward must:
-```
-GEMM output: FP32 in registers
-    → Convert FP32 to FP8 (per-element cast)
-    → Scatter FP8 to swizzled SMEM (per-byte writes with swizzle formula)
-    → __syncthreads() (wait for all warps)
-    → LDSM from swizzled SMEM to registers (next GEMM input)
-    → Execute next GEMM
-```
-
-This chain happens 4-5 times per M-block:
-- P scatter (Phase E): acc_s FP32 → FP8 transposed → smem_q → GEMM-3
-- dO→FP8 (Phase H): GMEM BF16 → FP8 → smem_pds → GEMM-2
-- dO→dO^T (Phase F): GMEM BF16 → FP8 transposed → smem_pds → GEMM-3
-- dS dual scatter (Phase LM): acc_s FP32 → FP8 to smem_q + smem_pds → GEMM-4/5
-- Q→Q^T (Phase D): FP8 SMEM → FP8 transposed SMEM → GEMM-4
-
-Each round-trip: 16384 elements / 256 threads = 64 ops per thread + sync overhead.
-The forward has only 1 such round-trip (P scatter) because K/V are pre-loaded via TMA.
-
-**2. No compute-memory overlap (~20% of overhead)**
-
-The forward uses TMA async pipelining: K[n+1]/V[n+1] load overlaps with GEMM[n].
-The backward loads Q synchronously (all threads blocked during GMEM→SMEM), and every
-memory phase (D, H, E, F, LM) forces the TC to idle during the sync.
-
-6 syncs × ~50 ns each = 300 ns direct cost, but the REAL cost is the serialization:
-the TC can't start the next GEMM until the previous memory phase + sync completes.
-
-**3. Register spills (~10% of overhead)**
-
-1440B stores + 1440B loads per thread = 360 FP32 spills. At ~10-20 cycles each through L1,
-this adds ~0.5-1 µs per M-block. Less than before (1624B) but still significant.
-
-**4. GMEM dO reads (~10% of overhead)**
-
-Phase H and Phase F each read 128×128 BF16 = 32KB from GMEM. Phase H is an L2 miss
-(first access); Phase F hits L2 cache. Transposed access in Phase F causes suboptimal
-cache line utilization.
-
-## The Fundamental Problem: FP8 Conversion Tax
-
-The core issue is **architectural**: SM120's block-scaled WGMMA requires FP8 operands
-loaded from SMEM via LDSM. Every intermediate result (P, dP, dS, dO_fp8, dO^T, Q^T)
-must go through the expensive conversion pipeline:
+The remaining ~2x gap to BF16 is architectural. Between every pair of GEMMs, the backward must:
 
 ```
-Register (FP32) → Convert → Scatter to swizzled SMEM → sync → LDSM → Register → MMA
+GEMM output (FP32 registers)
+  → FP32→FP8 conversion (software, ~15-25 cycles per element)
+  → Scatter to swizzled SMEM (per-byte writes with swizzle formula)
+  → __syncthreads() (256 threads wait)
+  → LDSM from swizzled SMEM to registers
+  → Next GEMM
 ```
 
-cuDNN's BF16 approach on Blackwell avoids this because:
-1. BF16 intermediates don't need per-block scale factors (no identity SF overhead)
-2. cuDNN on SM100 uses TMEM (tensor memory) to keep intermediates on-chip
-3. Descriptor-based WGMMA can read SMEM without explicit LDSM
-4. cuDNN likely uses warp-specialized producer/consumer model
+This chain repeats 4-5 times per M-block:
+1. P scatter (Phase E): FP32 acc → FP8 transposed → smem_q → GEMM-3 reads P^T
+2. dO→FP8 (Phase H): GMEM BF16 → FP8 → smem_pds → GEMM-2 reads dO_fp8
+3. dO→dO^T (Phase F): GMEM BF16 → FP8 transposed → smem_pds → GEMM-3 reads dO^T
+4. dS dual scatter (Phase LM): FP32 → FP8 → smem_q + smem_pds → GEMM-4/5 read
+5. Q→Q^T (Phase D): FP8 SMEM → FP8 transposed SMEM → GEMM-4 reads Q^T
 
-On SM120 (consumer Blackwell), we don't have TMEM, and our per-warp MMA requires
-explicit LDSM. The FP8 conversion tax is unavoidable with the current MMA approach.
+The forward has only **1 round-trip** (P scatter), with K/V pre-loaded via TMA pipeline.
 
-## Next Steps to Close the Gap (ranked by expected impact)
+### Why cuDNN BF16 avoids this:
+1. **No FP8 conversion** — BF16 operands go directly to MMA
+2. **TMEM on sm_100** — keeps intermediates in tensor memory (SM120 lacks TMEM)
+3. **Descriptor-based WGMMA** — reads SMEM without explicit LDSM
+4. **Warp-specialized producer/consumer** — overlaps memory with compute
 
-### Option A: Fuse Phase D+H into overlapped execution (medium impact, ~5-10%)
+### Theoretical minimum on SM120:
+At forward-level TC utilization (~80%), pure GEMM time for backward would be ~0.64 ms
+for (1,2048,32,128,F). Adding irreducible FP8 conversion pipeline latency (~0.3-0.5 ms),
+the theoretical best is **~1.0 ms** vs current 2.18 ms. Still ~2× room, but requires
+near-perfect memory/compute overlap that likely needs TMEM or descriptor-based MMA.
 
-Currently Phase D (Q→Q^T) and Phase H (dO→FP8) happen sequentially before sync #2.
-But Phase D reads smem_q while Phase H reads GMEM (dO) — they don't conflict on SMEM.
-They could run truly in parallel if we overlap them within the same code block,
-reducing the wall-clock time for this phase by ~30-40%.
+## Remaining Optimization Options (diminishing returns)
 
-Additionally, Phase H could start BEFORE sync #1 completes, because Phase H reads
-from GMEM (not SMEM). Only Phase D needs to wait for sync #1 (Q in smem_q).
+| Option | Expected | Feasibility |
+|---|---|---|
+| Vectorize FP8 scatter (uint32 writes) | 3-5% | Medium — swizzle alignment within 16B chunks |
+| Reduce sync count (6→4) | 2-5% | Medium — reorder phases to merge compatible syncs |
+| Fuse Phase D+H overlap | 2-3% | Low effort — already writes to disjoint SMEM |
+| Reduce register spills further | 2-5% | Low — try `__noinline__` functions |
+| TMA Q pipelining | <1% | High effort, Q load is only 0.4% of M-block time |
 
-### Option B: TMA async Q loads + M-block pipelining (medium-high impact, ~10-15%)
+Combined: potentially ~10-15% more, bringing gap from ~2.1x to ~1.8x vs BF16.
 
-Replace cooperative Q load with single-thread TMA. Double-buffer smem_q across M-blocks:
-load Q[m+1] via TMA during M-block m's compute phases. This hides Phase A latency
-entirely and frees 255 threads from load duty.
+## Hardware Constraints (RTX 5090 / SM 12.0)
 
-SMEM cost: +16KB for double-buffered Q. Total: 82+16=98KB. Fits in 100KB.
+- **100 KB SMEM per SM** (Hopper/B100: 228 KB)
+- **255 registers max** with 1440B pre-existing spills
+- **No TMEM** (tensor memory, only on sm_100 data center Blackwell)
+- **Per-warp WGMMA** via LDSM (not descriptor-based like SM90 GMMA)
+- **Block-scaled FP8 MMA** requires Blk_MN=128, kSFVecSize=32
 
-This is the same pattern the forward kernel uses for K/V pipelining.
+## Benchmark Results (current, kBlockM=128 + GMEM dO + pipelined LDSM/MMA)
 
-### Option C: Reduce sync count by reordering phases (medium impact, ~5-10%)
+| Config (b,s,h,d) | FP8 fwd | FP8 bwd | f+b ms | TFLOPS | BF16 fwd | BF16 bwd | f+b ms | TFLOPS | Ratio |
+|---|---|---|---|---|---|---|---|---|---|
+| (1,512,32,128,F) | 0.039 | 0.177 | 0.216 | 69.5 | 0.032 | 0.089 | 0.121 | 124.3 | 0.56x |
+| (1,1024,32,128,F) | 0.079 | 0.632 | 0.710 | 84.7 | 0.110 | 0.287 | 0.397 | 151.5 | 0.56x |
+| (1,2048,32,128,F) | 0.250 | 2.179 | 2.429 | 99.0 | 0.417 | 0.952 | 1.369 | 175.7 | 0.56x |
+| (1,4096,32,128,F) | 0.813 | 8.549 | 9.362 | 102.8 | 1.443 | 3.410 | 4.853 | 198.2 | 0.52x |
+| (4,512,32,128,F) | 0.094 | 0.775 | 0.870 | 69.1 | 0.114 | 0.314 | 0.428 | 140.5 | 0.49x |
+| (4,1024,32,128,F) | 0.243 | 2.464 | 2.707 | 88.9 | 0.378 | 1.036 | 1.414 | 170.0 | 0.52x |
+| (4,2048,32,128,F) | 0.796 | 8.849 | 9.645 | 99.7 | 1.364 | 3.589 | 4.954 | 194.2 | 0.51x |
+| (1,1024,32,128,C) | 0.056 | 0.445 | 0.501 | 60.0 | 0.083 | 0.178 | 0.261 | 115.1 | 0.52x |
+| (1,2048,32,128,C) | 0.144 | 1.247 | 1.391 | 86.4 | 0.235 | 0.538 | 0.773 | 155.6 | 0.56x |
+| (1,4096,32,128,C) | 0.449 | 3.876 | 4.325 | 111.2 | 0.774 | 1.823 | 2.597 | 185.2 | 0.60x |
+| (2,2048,32,128,C) | 0.249 | 2.265 | 2.514 | 95.7 | 0.409 | 1.056 | 1.465 | 164.2 | 0.58x |
+| (4,2048,32,128,C) | 0.476 | 4.181 | 4.657 | 103.3 | 0.745 | 2.098 | 2.843 | 169.2 | 0.61x |
 
-Current: 6 syncs per M-block. Each sync serializes compute and memory.
-Target: 4-5 syncs by fusing compatible phases.
-
-Potential merges:
-- Merge sync #3 with Phase E scatter (Phase E writes smem_q, Phase F writes smem_pds — disjoint)
-- Move Phase D earlier (overlap with GEMM-1 for compute warps, memory for others)
-
-### Option D: Reduce register spills via code restructuring (low-medium impact, ~3-5%)
-
-Split the M-block body into smaller `__noinline__` functions to give the compiler
-smaller register allocation scopes. Or use `#pragma unroll 1` on the M-block loop
-to reduce code duplication.
-
-### Option E: Vectorize the FP8 scatter operations (medium impact, ~5-10%)
-
-Currently each scatter writes one FP8 byte at a time with per-byte swizzle computation.
-If we restructure the scatter to write 4 or 8 bytes at a time (uint32_t or uint64_t),
-the SMEM write throughput would improve by 4-8×.
-
-This requires grouping consecutive register elements that map to consecutive SMEM
-addresses after swizzle. With the 128-byte swizzle pattern (Swizzle<3,4,3>),
-consecutive elements within a 16-byte chunk share the same swizzle offset.
-This means we CAN vectorize within 16-byte groups.
-
-### Option F: Switch GEMMs 2-5 to BF16 MMA (exploratory, uncertain impact)
-
-GEMMs 2-5 all use identity scale factors — the block scaling adds zero value.
-BF16 mma.sync (SM80-style) has half the throughput but:
-- BF16 → SMEM writes are 2 bytes (vs 1 byte FP8), but no FP32→FP8 conversion needed
-- BF16 intermediates (P, dS) could potentially stay in BF16, skipping the FP32→FP8→BF16 chain
-- Simpler scatter (BF16 to BF16 SMEM, no FP8 conversion)
-
-Trade-off: 2× lower MMA throughput vs ~2× less conversion overhead. Net uncertain.
-
-## Estimated Impact and Priority
-
-| Option | Impact | Effort | Risk |
-|---|---|---|---|
-| B: TMA Q pipeline | 10-15% | High | Low (proven pattern from fwd) |
-| E: Vectorized scatter | 5-10% | Medium | Medium (swizzle alignment) |
-| A: Fuse D+H overlap | 5-10% | Low | Low |
-| C: Reduce syncs | 5-10% | Medium | Medium (correctness) |
-| D: Reduce spills | 3-5% | Low | Low |
-| F: BF16 GEMMs 2-5 | Uncertain | Very High | High (full rewrite) |
-
-**Recommended next step: Option B (TMA Q pipelining)** — it's the single change most
-likely to give double-digit improvement. It eliminates the Phase A load stall (~0.5µs/M-block)
-and, more importantly, overlaps the next M-block's Q load with the current M-block's
-compute phases.
-
-Combined B+A+E could potentially give 20-30% improvement, bringing the gap from
-~2.3x to ~1.8x vs BF16.
-
-## Theoretical Analysis: Can We Ever Match BF16?
-
-**Short answer: probably not on SM120, but we can get much closer.**
-
-The fundamental FP8 conversion tax (5 scatter/convert round-trips per M-block) adds
-~15-20 µs of overhead per 46 µs M-block. Even if we perfectly overlap all memory
-operations with compute, the FP8→SMEM→LDSM pipeline latency cannot be hidden because
-each GEMM's output must be converted before the next GEMM can start (data dependency).
-
-The theoretical minimum backward time on SM120 (all memory hidden, zero sync overhead):
-- Pure GEMM time at forward efficiency: ~0.64 ms for (1,2048,32,128,F)
-- FP8 conversion pipeline latency (serial, cannot be hidden): ~0.3-0.5 ms
-- **Theoretical best: ~1.0-1.1 ms** vs BF16's 0.95 ms → roughly parity
-
-Current: 2.21 ms. Theoretical best: ~1.0 ms. There's still 2× room for improvement,
-but it requires near-perfect memory/compute overlap, which likely needs architectural
-support (TMEM, descriptor-based MMA) that SM120 doesn't have.
+Ratio = SDPA_time / SM120_time (>1 = SM120 faster).
+Best combined TFLOPS: 111.2 at (1,4096,32,128,C).
+Forward alone: ~347 TFLOPS (1.7x faster than BF16).
 
 ## Files Modified
 
 | File | Changes |
 |---|---|
-| `mainloop_bwd_sm120_tma_mma.hpp` | kBlockM=128, GMEM dO reads, no zero-fills/padding |
+| `mainloop_bwd_sm120_tma_mma.hpp` | kBlockM=128, GMEM dO, no zero-fills, pipelined LDSM/MMA |
 | `tile_size_bwd_sm120.h` | kBlockM 64→128 |
 | `bwd_optimization_analysis.md` | This file |
